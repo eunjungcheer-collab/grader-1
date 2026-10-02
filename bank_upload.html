@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#C1392B">
+<title>문항 가져오기 - 자동 채점 시스템</title>
+<link rel="stylesheet" href="css/style.css?v=202609290852">
+</head>
+<body>
+<template id="page-content">
+  <span class="backlink"><a href="bank_list.html">← 문제은행</a></span>
+  <h1>PDF에서 문항 가져오기</h1>
+  <p class="muted">시험지 PDF를 올리면 문항을 하나씩 잘라내요. <b>왼쪽에 PDF를 띄워놓고 보면서 오른쪽에 정답·난이도를 입력</b>하세요. 여러 파일을 한 번에 골라도 돼요. 단원은 파일명으로 미리 채워드려요.</p>
+  <div id="error-banner"></div>
+
+  <div class="card" id="pick-card">
+    <label>시험지 PDF (여러 개 선택 가능)</label>
+    <input type="file" id="pdf-files" accept="application/pdf" multiple>
+    <button type="button" class="btn primary" id="scan-btn" style="width:100%; margin-top:16px;">문항 자동으로 잘라내기</button>
+  </div>
+
+  <div id="review-area" style="display:none;">
+    <p class="hint" id="review-summary"></p>
+
+    <div class="card" style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <b>난이도 일괄</b>
+        <div class="seg" id="bulk-diff"><button type="button" data-d="상">상</button><button type="button" data-d="중">중</button><button type="button" data-d="하">하</button></div>
+        <button type="button" class="btn ghost" id="bulk-clear" style="padding:7px 10px;">모두 미정</button>
+      </div>
+      <div class="diff-inputs" style="margin:0;">
+        <b>🤖 자동 추정</b> 상 <input type="text" id="pct-top" value="30" inputmode="numeric">% · 하 <input type="text" id="pct-low" value="30" inputmode="numeric">%
+        <button type="button" class="btn primary" id="auto-diff" style="padding:7px 12px;">다시 분류</button>
+      </div>
+      <span class="hint" style="flex-basis:100%; margin:0;">자동 추정은 해설 길이·계산/자료 유무 등으로 매긴 <b>추정</b>이에요. 틀릴 수 있으니 카드에서 눌러 고치세요.</span>
+    </div>
+
+    <div id="bulk-cards"></div>
+
+    <div class="split">
+      <div class="pane-left">
+        <div class="vhead">
+          <select id="v-file" style="margin:0; padding:6px; font-size:13px; max-width:180px;"></select>
+          <input type="number" id="go-page" min="1" placeholder="쪽">
+          <button type="button" class="btn ghost" id="go-btn">이동</button>
+          <button type="button" class="btn outline" id="go-answer">정답 쪽으로</button>
+          <button type="button" class="btn ghost" id="zoom-out">−</button>
+          <button type="button" class="btn ghost" id="zoom-in">＋</button>
+          <span class="hint" id="v-now" style="margin:0;"></span>
+        </div>
+        <div class="vscroll" id="vscroll"></div>
+      </div>
+      <div class="pane-right">
+        <p class="hint">💡 정답칸에 숫자를 치면 다음 문항으로 넘어가요. 정답칸을 누르면 왼쪽 PDF에서 그 문항의 정답 위치를 찾아줘요. 문제 그림을 누르면 크게 보여요.</p>
+        <div id="cards"></div>
+        <button type="button" class="btn primary" id="save-btn" style="width:100%; margin:16px 0;">체크된 문항 문제은행에 저장</button>
+      </div>
+    </div>
+  </div>
+  <datalist id="unit-list"></datalist>
+</template>
+
+<script src="js/vendor/pdf.min.js?v=202609290852"></script>
+<script src="js/config.js?v=202609290852"></script>
+<script src="js/api.js?v=202609290852"></script>
+<script src="js/common.js?v=202609290852"></script>
+<script src="js/bankcore.js?v=202609290852"></script>
+<script src="js/pdfui.js?v=202609290852"></script>
+<script src="js/pdfview.js?v=202609290852"></script>
+<script>
+requireLogin();
+renderHeader({ wide: true, wider: true });
+setupPdfJs();
+const $ = id => document.getElementById(id);
+const CROP_SCALE = BankCore.CROP_SCALE;
+let items = [];   // {fileIndex, source, q, canvas, explCanvas, preview, snippetUrl, unit, answer, difficulty, diffScore, num}
+let files = [];   // {name, doc, scan, startPage}
+let pane = null, viewFi = -1;
+
+callApi('listQuestions', { password: getTeacherPassword() }).then(res => {
+  if (!res.ok) return;
+  const units = Array.from(new Set(res.questions.map(q => q.unit)));
+  $('unit-list').innerHTML = units.map(u => '<option value="' + escapeHtml(u) + '">').join('');
+}).catch(() => {});
+
+$('scan-btn').addEventListener('click', async function () {
+  const chosen = Array.from($('pdf-files').files);
+  $('error-banner').innerHTML = '';
+  if (!chosen.length) { $('error-banner').innerHTML = '<div class="banner error">PDF 파일을 선택해주세요.</div>'; return; }
+  items = []; files = []; viewFi = -1;
+  showSpinner('PDF 분석 중...');
+  try {
+    for (let fi = 0; fi < chosen.length; fi++) {
+      const f = chosen[fi];
+      updateSpinner('(' + (fi + 1) + '/' + chosen.length + ') ' + f.name + ' 분석 중...');
+      const { doc } = await loadPdfDoc(f);
+      const scan = await BankCore.scanPdf(doc);
+
+      // 글자로 된 정답표가 있으면 읽어서 미리 채운다
+      let tableInfo = null;
+      try { tableInfo = await BankCore.parseAnswerTable(doc, scan); } catch (e) {}
+      if (tableInfo && Object.keys(tableInfo.answers).length) {
+        Object.keys(tableInfo.answers).forEach(n => {
+          if (!scan.answers[n]) scan.answers[n] = { page: null, rect: null, text: tableInfo.answers[n] };
+          else if (!scan.answers[n].text) scan.answers[n].text = tableInfo.answers[n];
+        });
+      }
+      const lastQ = scan.questionPages.length ? Math.max.apply(null, scan.questionPages) : 0;
+      const startPage = scan.answerPages[0] || (tableInfo && tableInfo.pages[0]) || (lastQ && lastQ < scan.pageCount ? lastQ + 1 : scan.pageCount);
+      files.push({ name: f.name, doc: doc, scan: scan, startPage: startPage });
+
+      let dScores = {};
+      try { dScores = await BankCore.difficultyScores(doc, scan); } catch (e) {}
+      let subj = {};
+      try { subj = await BankCore.subjectiveGuess(doc, scan); } catch (e) {}
+      const defaultUnit = baseNoExt(f.name);
+      for (let k = 0; k < scan.questions.length; k++) {
+        const q = scan.questions[k];
+        updateSpinner('(' + (fi + 1) + '/' + chosen.length + ') ' + f.name + ' — ' + (k + 1) + '/' + scan.questions.length + '번 문항 자르는 중');
+        const canvas = await BankCore.renderRect(doc, q.page, q.rect, CROP_SCALE, true);
+        const ans = scan.answers[q.num];
+        let snippetUrl = '';
+        if (ans && !ans.text && ans.rect) {
+          try { snippetUrl = (await BankCore.renderRect(doc, ans.page, ans.rect, 3, false)).toDataURL('image/png'); } catch (e) {}
+        }
+        let explCanvas = null;
+        const ex = scan.explanations && scan.explanations[q.num];
+        if (ex) { try { explCanvas = await BankCore.renderExplanation(doc, ex, 2.2); } catch (e) {} }
+        items.push({
+          fileIndex: fi, source: f.name, q: q, canvas: canvas, explCanvas: explCanvas, explInfo: ex || null,
+          preview: await BankCore.textPreview(doc, q.page, q.rect, 60),
+          snippetUrl: snippetUrl, difficulty: '', diffScore: (dScores[q.num] === undefined ? null : dScores[q.num]),
+          unit: defaultUnit, answer: subj[q.num] ? '-' : (ans && ans.text ? ans.text : ''),
+        });
+      }
+    }
+    if (!items.length) {
+      $('error-banner').innerHTML = '<div class="banner error">문항을 찾지 못했어요. 문항 번호가 텍스트로 된 PDF인지 확인해주세요.</div>';
+    } else {
+      autoClassify();
+      renderAll();
+    }
+  } catch (err) {
+    $('error-banner').innerHTML = '<div class="banner error">PDF를 읽는 중 문제가 생겼어요: ' + escapeHtml(err.message) + '</div>';
+  }
+  hideSpinner();
+});
+
+function refreshSummary() {
+  const vals = items.map((it, i) => { const el = document.querySelector('input.ans-input[data-i="' + i + '"]'); return el ? el.value : it.answer; });
+  const nSub = vals.filter(v => v === '-').length;
+  const nAns = vals.filter(v => v && v !== '-').length;
+  $('review-summary').textContent = '총 ' + items.length + '개 문항 (' + files.length + '개 파일) · 정답이 채워진 객관식 ' + nAns + '개 · 주관식 ' + nSub + '개' +
+    (nSub ? ' (문제 글자로 추정했거나 직접 체크한 것 — 아니면 「주관식」 체크를 해제하세요)' : '');
+}
+
+function renderAll() {
+  $('review-area').style.display = 'block';
+  refreshSummary();
+  $('v-file').innerHTML = files.map((f, i) => '<option value="' + i + '">' + escapeHtml(f.name) + '</option>').join('');
+  $('v-file').style.display = files.length > 1 ? '' : 'none';
+
+  // 파일별 정답 붙여넣기 칸
+  $('bulk-cards').innerHTML = files.map((f, i) => `
+    <div class="card" style="padding:10px 12px;">
+      <b style="font-size:13px;">${escapeHtml(f.name)}</b> <span class="hint">정답 붙여넣기 (예: 31425… / 1③ 2① … / 줄마다 1. 3)</span>
+      <div style="display:flex; gap:8px; align-items:flex-start; margin-top:6px;">
+        <textarea class="bulk-ta" data-fi="${i}" rows="2" style="flex:1; padding:8px; border:1.5px solid var(--line); border-radius:8px; font-family:inherit;"></textarea>
+        <button type="button" class="btn outline bulk-apply" data-fi="${i}" style="padding:8px 12px;">적용</button>
+      </div>
+      <div class="hint bulk-msg" data-fi="${i}"></div>
+    </div>`).join('');
+  document.querySelectorAll('.bulk-apply').forEach(b => b.addEventListener('click', () => applyBulkAnswers(parseInt(b.dataset.fi, 10))));
+
+  $('cards').innerHTML = items.map((it, i) => `
+    <div class="qc" id="item-${i}" data-i="${i}">
+      <div><img class="qthumb" data-i="${i}" src="${it.canvas.toDataURL('image/png')}" title="누르면 크게 보여요"></div>
+      <div>
+        <div class="qmeta">${escapeHtml(it.source)} · p.${it.q.page} · ${it.q.num}번
+          <label class="bank-include-label" style="display:inline-flex; margin-left:8px; font-size:12px;"><input type="checkbox" class="inc" data-i="${i}" checked> 포함</label></div>
+        <div class="qrow2">
+          <div><div style="display:flex; justify-content:space-between; align-items:center; gap:8px;"><label style="margin:0;">정답</label><label class="sub-chk" title="주관식이면 체크 — 자동 채점에서 빠져요"><input type="checkbox" class="subchk" data-i="${i}"> 주관식</label></div><input type="text" class="ans-input bank-answer-input big-ans" data-i="${i}" inputmode="numeric" maxlength="1" value="${escapeHtml(it.answer)}"></div>
+          <div><label>난이도</label><div class="seg diff-seg" data-i="${i}" data-init="${it.difficulty}"><button type="button" data-d="상">상</button><button type="button" data-d="중">중</button><button type="button" data-d="하">하</button></div></div>
+          <div style="flex:1; min-width:150px;"><label>단원</label><input type="text" class="unit-in" data-i="${i}" list="unit-list" value="${escapeHtml(it.unit)}"></div>
+        </div>
+        ${it.snippetUrl ? '<img class="snip" src="' + it.snippetUrl + '" title="원본 정답 표시">' : ''}
+        ${it.explCanvas ? '<div class="hint" style="margin:4px 0 0;">📝 해설도 같이 저장돼요</div>' : ''}
+        <details>
+          <summary>잘림 조정 · 문제 글자 보기</summary>
+          ${it.preview ? '<p class="hint bank-text-preview">' + escapeHtml(it.preview) + '</p>' : ''}
+          <div class="bank-crop-adjust">
+            <div><label>위 여백(pt)</label><input type="text" id="top-${i}" value="0" class="bank-adj-input"></div>
+            <div><label>아래 여백(pt)</label><input type="text" id="bot-${i}" value="0" class="bank-adj-input"></div>
+            <button type="button" class="btn ghost bank-recrop-btn" data-i="${i}">다시 자르기</button>
+          </div>
+          <p class="hint">음수 = 넓게, 양수 = 좁게</p>
+        </details>
+      </div>
+    </div>`).join('');
+
+  attachAnswerAdvance($('cards'));
+  document.querySelectorAll('.diff-seg').forEach(seg => paintSeg(seg, seg.dataset.init));
+  document.querySelectorAll('.diff-seg').forEach(seg => {
+    const i = parseInt(seg.dataset.i, 10);
+    seg.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      items[i].difficulty = items[i].difficulty === b.dataset.d ? '' : b.dataset.d;
+      paintSeg(seg, items[i].difficulty);
+    }));
+  });
+  document.querySelectorAll('.bank-recrop-btn').forEach(b => b.addEventListener('click', () => recrop(parseInt(b.dataset.i, 10))));
+  document.querySelectorAll('.qthumb').forEach(im => im.addEventListener('click', () => zoomImg(im.src)));
+  document.querySelectorAll('input.ans-input').forEach(inp => {
+    const i = parseInt(inp.dataset.i, 10), card = document.getElementById('item-' + i);
+    const chk = card.querySelector('.subchk');
+    inp.addEventListener('focus', () => focusItem(i));
+    inp.addEventListener('input', () => { if (inp.value === '-') { setSubjective(inp, true, card); chk.checked = true; refreshSummary(); } });
+    chk.addEventListener('change', () => { setSubjective(inp, chk.checked, card); if (!chk.checked) inp.focus(); refreshSummary(); });
+    if (items[i].answer === '-') { setSubjective(inp, true, card); chk.checked = true; }     // 문제 글자로 추정한 주관식
+  });
+  refreshSummary();
+  setupPane();
+}
+
+// ── 왼쪽 PDF ──
+async function showFile(fi, page) {
+  if (!pane) pane = new PdfPane($('vscroll'));
+  if (viewFi !== fi) {
+    viewFi = fi;
+    $('v-file').value = fi;
+    await pane.setDoc(files[fi].doc, page || files[fi].startPage);
+  } else if (page) pane.scrollToPage(page);
+}
+function setupPane() {
+  pane = null; viewFi = -1;
+  $('vscroll').innerHTML = '';
+  showFile(0);
+}
+$('v-file').addEventListener('change', () => showFile(parseInt($('v-file').value, 10)));
+$('go-btn').addEventListener('click', () => { const p = parseInt($('go-page').value, 10); if (p && pane) pane.scrollToPage(p); });
+$('go-page').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('go-btn').click(); } });
+$('go-answer').addEventListener('click', () => { if (viewFi >= 0) showFile(viewFi, files[viewFi].startPage); });
+$('zoom-in').addEventListener('click', () => pane && pane.setScale(pane.scale * 1.2));
+$('zoom-out').addEventListener('click', () => pane && pane.setScale(pane.scale / 1.2));
+
+// 정답칸을 누르면: 그 문항의 파일을 왼쪽에 띄우고, 정답(해설) 위치에 빨간 테두리를 표시
+async function focusItem(i) {
+  const it = items[i];
+  document.querySelectorAll('.qc.focus').forEach(x => x.classList.remove('focus'));
+  document.getElementById('item-' + i).classList.add('focus');
+  $('v-now').textContent = it.q.num + '번 문항';
+  const f = files[it.fileIndex];
+  const a = f.scan.answers[it.q.num];
+  const ex = f.scan.explanations && f.scan.explanations[it.q.num];
+  await showFile(it.fileIndex);
+  if (a && a.page && a.rect) pane.highlight(a.page, a.rect);
+  else if (ex && ex.segments.length) pane.highlight(ex.segments[0].page, ex.segments[0].rect);
+}
+
+// ── 정답 붙여넣기 (파일별) ──
+function applyBulkAnswers(fi) {
+  const ta = document.querySelector('.bulk-ta[data-fi="' + fi + '"]');
+  const msg = document.querySelector('.bulk-msg[data-fi="' + fi + '"]');
+  const r = parseBulkAnswers(ta.value);
+  const mine = items.map((it, i) => ({ it: it, i: i })).filter(x => x.it.fileIndex === fi).sort((a, b) => a.it.q.num - b.it.q.num);
+  let n = 0;
+  r.answers.forEach((a, k) => {
+    if (!a) return;
+    const target = r.mode === 'pairs' ? mine.find(x => x.it.q.num === k + 1) : mine[k];
+    if (!target) return;
+    const inp = document.querySelector('input.ans-input[data-i="' + target.i + '"]');
+    const card = document.getElementById('item-' + target.i), chk = card.querySelector('.subchk');
+    if (a === '-') { setSubjective(inp, true, card); chk.checked = true; }
+    else { if (inp.disabled) { setSubjective(inp, false, card); chk.checked = false; } inp.value = a; }
+    target.it.answer = a; n++;
+  });
+  msg.innerHTML = n + '개를 채웠어요 (' + (r.mode === 'pairs' ? '번호+정답' : '순서대로') + ', 이 파일 문항 ' + mine.length + '개).' +
+    (r.parsed !== mine.length && r.mode === 'seq' ? ' <span style="color:#B45309; font-weight:700;">⚠️ 붙여넣은 정답 ' + r.parsed + '개 ≠ 문항 ' + mine.length + '개, 확인해주세요.</span>' : ' ✅');
+  refreshSummary();
+}
+
+// 절대 좌표 rect를 자른 이미지(base) 기준 상대 좌표로 바꾼다 (소수 첫째 자리까지)
+function relRect(nr, base) {
+  if (!nr || !base) return null;
+  const r = v => Math.round(v * 10) / 10;
+  return [r(nr[0] - base[0]), r(nr[1] - base[1]), r(nr[2] - base[0]), r(nr[3] - base[1])];
+}
+
+// ── 난이도 ──
+function paintSeg(seg, d) { seg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.d === d)); }
+function autoClassify() {
+  const top = Math.max(0, Math.min(100, parseInt($('pct-top').value, 10) || 0));
+  const low = Math.max(0, Math.min(100 - top, parseInt($('pct-low').value, 10) || 0));
+  const byFile = {};
+  items.forEach((it, i) => { if (it.diffScore !== null) (byFile[it.fileIndex] = byFile[it.fileIndex] || []).push(i); });
+  Object.values(byFile).forEach(list => {
+    if (list.length < 3) return;
+    const res = BankCore.classifyByRank(list.map(i => items[i].diffScore), top, low);
+    list.forEach((i, k) => { items[i].difficulty = res[k]; });
+  });
+}
+$('auto-diff').addEventListener('click', () => {
+  autoClassify();
+  items.forEach((it, i) => { const seg = document.querySelector('.diff-seg[data-i="' + i + '"]'); if (seg) paintSeg(seg, it.difficulty); });
+});
+function applyBulkDiff(d) {
+  items.forEach((it, i) => { it.difficulty = d; const seg = document.querySelector('.diff-seg[data-i="' + i + '"]'); if (seg) paintSeg(seg, d); });
+  paintSeg($('bulk-diff'), d);
+}
+$('bulk-diff').querySelectorAll('button').forEach(b => b.addEventListener('click', () => applyBulkDiff(b.dataset.d)));
+$('bulk-clear').addEventListener('click', () => applyBulkDiff(''));
+
+async function recrop(i) {
+  const it = items[i];
+  const top = parseFloat($('top-' + i).value) || 0, bot = parseFloat($('bot-' + i).value) || 0;
+  it.q.rect = [it.q.rect[0], it.q.rect[1] + top, it.q.rect[2], it.q.rect[3] + bot];
+  $('top-' + i).value = 0; $('bot-' + i).value = 0;
+  it.canvas = await BankCore.renderRect(files[it.fileIndex].doc, it.q.page, it.q.rect, CROP_SCALE, false);
+  document.querySelector('.qthumb[data-i="' + i + '"]').src = it.canvas.toDataURL('image/png');
+}
+
+$('save-btn').addEventListener('click', async function () {
+  const picked = [];
+  let bad = 0;
+  items.forEach((it, i) => {
+    if (!document.querySelector('.inc[data-i="' + i + '"]').checked) return;
+    it.unit = document.querySelector('.unit-in[data-i="' + i + '"]').value.trim();
+    it.answer = document.querySelector('input.ans-input[data-i="' + i + '"]').value.trim();
+    if (!it.unit) { bad++; return; }
+    picked.push(it);
+  });
+  if (bad) { alert('단원이 비어있는 문항이 ' + bad + '개 있어요. 단원을 입력하거나 "포함"을 해제해주세요.'); return; }
+  if (!picked.length) { alert('저장할 문항이 없어요.'); return; }
+  const noAns = picked.filter(it => !it.answer).length;
+  if (noAns && !confirm('정답이 비어있는 문항이 ' + noAns + '개 있어요. (나중에 문제은행에서 채울 수 있어요) 그대로 저장할까요?')) return;
+
+  showSpinner('저장 중... 0/' + picked.length);
+  try {
+    // 문항마다 드라이브에 이미지 파일을 만드느라 서버가 오래 걸리므로, 3문항씩 묶어서 3개 요청을 동시에 보낸다
+    const BATCH = 3, PARALLEL = 3;
+    const chunks = [];
+    for (let s = 0; s < picked.length; s += BATCH) chunks.push(picked.slice(s, s + BATCH));
+    let done = 0, next = 0, failure = null;
+    const worker = async () => {
+      while (!failure) {
+        const k = next++;
+        if (k >= chunks.length) return;
+        const payload = chunks[k].map(it => ({
+          id: 'q' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+          unit: it.unit, answer: it.answer, source: it.source, textPreview: it.preview,
+          imageBase64: BankCore.canvasToBase64(it.canvas),
+          explBase64: it.explCanvas ? BankCore.canvasToBase64(it.explCanvas) : '',
+          difficulty: it.difficulty || '', diffScore: it.diffScore,
+          numRect: relRect(it.q.numRect, it.q.rect),
+          explNumRect: (it.explInfo && it.explInfo.numRect && it.explInfo.segments.length) ? relRect(it.explInfo.numRect, it.explInfo.segments[0].rect) : null,
+        }));
+        const res = await callApi('saveQuestions', { password: getTeacherPassword(), questions: payload });
+        if (!res.ok) { failure = new Error(res.error || '저장 실패'); return; }
+        done += payload.length;
+        updateSpinner('저장 중... ' + done + '/' + picked.length);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(PARALLEL, chunks.length) }, worker));
+    if (failure) throw failure;
+    location.href = 'bank_list.html';
+  } catch (err) {
+    hideSpinner();
+    alert('저장 중 오류가 났어요: ' + err.message + '\n(이미 저장된 일부 문항은 문제은행에 들어가 있을 수 있어요)');
+  }
+});
+</script>
+</body>
+</html>

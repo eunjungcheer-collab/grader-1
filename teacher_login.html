@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#C1392B">
+<title>로그인 - 자동 채점 시스템</title>
+<link rel="stylesheet" href="css/style.css?v=202609290852">
+</head>
+<body>
+<template id="page-content">
+  <h1>선생님 로그인</h1>
+  <div id="error-banner"></div>
+  <form id="login-form" class="card">
+    <label>비밀번호</label>
+    <input type="password" id="password" required autofocus>
+    <button type="submit" class="btn primary" style="width:100%; margin-top:16px;">로그인</button>
+  </form>
+</template>
+
+<script src="js/config.js?v=202609290852"></script>
+<script src="js/api.js?v=202609290852"></script>
+<script src="js/common.js?v=202609290852"></script>
+<script>
+renderHeader();
+
+document.getElementById('login-form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  const password = document.getElementById('password').value;
+  const errorBox = document.getElementById('error-banner');
+  errorBox.innerHTML = '';
+  try {
+    const res = await callApi('login', { password: password });
+    if (res.ok) {
+      sessionStorage.setItem('teacher_pw', password);
+      location.href = 'index.html';
+    } else {
+      errorBox.innerHTML = '<div class="banner error">비밀번호가 올바르지 않아요.</div>';
+    }
+  } catch (err) {
+    errorBox.innerHTML = '<div class="banner error">서버에 연결할 수 없어요. API_URL 설정을 확인해주세요.</div>';
+  }
+});
+</script>
+</body>
+</html>

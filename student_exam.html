@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#C1392B">
+<title>답안 제출 - 자동 채점 시스템</title>
+<link rel="stylesheet" href="css/style.css?v=202609290852">
+</head>
+<body>
+<template id="page-content">
+  <div id="content-area" class="muted">불러오는 중...</div>
+</template>
+
+<script src="js/config.js?v=202609290852"></script>
+<script src="js/api.js?v=202609290852"></script>
+<script src="js/common.js?v=202609290852"></script>
+<script>
+renderHeader();  // 학생은 로그인 필요 없음 — requireLogin() 호출 안 함
+
+const examId = new URLSearchParams(location.search).get('id');
+function escapeHtml(v) { return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+let answerCount = 0;
+let subjective = [];   // 주관식 문항 번호(1부터)
+const isSub = i => subjective.indexOf(i + 1) >= 0;
+let studentAnswers = [];
+
+async function loadExam() {
+  const area = document.getElementById('content-area');
+  if (!examId) { area.innerHTML = '<div class="banner error">잘못된 링크예요.</div>'; return; }
+
+  try {
+    const res = await callApi('getExamPublic', { id: examId });
+    if (!res.ok) { area.innerHTML = '<div class="banner error">' + res.error + '</div>'; return; }
+
+    answerCount = res.answerCount;
+    subjective = res.subjective || [];
+    studentAnswers = new Array(answerCount).fill('');
+
+    area.innerHTML = `
+      <h1>${res.title}</h1>
+      <p class="muted">이름과 정답을 입력하고 제출하면 바로 채점돼요.${subjective.length ? '<br><b>주관식(' + subjective.join(', ') + '번)은 회색으로 표시돼요.</b> 여기서 입력하지 않고 선생님이 따로 채점해요.' : ''}</p>
+      <form id="answer-form" class="card">
+        <label>이름</label>
+        <input type="text" id="student-name" required>
+        <div id="answer-grid" style="margin-top:16px;"></div>
+        <button type="submit" class="btn primary" style="width:100%; margin-top:20px;">제출하고 채점받기</button>
+      </form>
+    `;
+
+    const grid = document.getElementById('answer-grid');
+    for (let i = 0; i < answerCount; i++) {
+      const row = document.createElement('div');
+      if (isSub(i)) {
+        row.className = 'qrow is-sub';
+        row.innerHTML = `<span class="qnum">${i + 1}</span><span class="sub-note">주관식 · 입력하지 않아요 (선생님이 채점)</span>`;
+        grid.appendChild(row);
+        continue;
+      }
+      row.className = 'qrow';
+      row.innerHTML = `
+        <span class="qnum">${i + 1}</span>
+        <div class="ans-btns">
+          ${[1, 2, 3, 4, 5].map(n => `<button type="button" class="ans-btn" data-q="${i}" data-v="${n}">${n}</button>`).join('')}
+        </div>`;
+      grid.appendChild(row);
+    }
+    grid.querySelectorAll('.ans-btn').forEach(btn => {
+      btn.addEventListener('click', function () {
+        const q = this.dataset.q, v = this.dataset.v;
+        studentAnswers[q] = v;
+        grid.querySelectorAll(`.ans-btn[data-q="${q}"]`).forEach(b => b.classList.remove('selected'));
+        this.classList.add('selected');
+      });
+    });
+
+    document.getElementById('answer-form').addEventListener('submit', submitAnswers);
+  } catch (err) {
+    area.innerHTML = '<div class="banner error">서버에 연결할 수 없어요.</div>';
+  }
+}
+
+async function submitAnswers(e) {
+  e.preventDefault();
+  const name = document.getElementById('student-name').value.trim();
+  if (!name) return;
+  if (studentAnswers.some((a, i) => !isSub(i) && !a)) { alert('주관식이 아닌 모든 문항에 답을 선택해주세요.'); return; }
+
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true;
+  btn.textContent = '채점 중...';
+
+  try {
+    const res = await callApi('submitAnswer', { id: examId, studentName: name, answers: studentAnswers });
+    if (!res.ok) { alert(res.error || '제출에 실패했어요.'); btn.disabled = false; btn.textContent = '제출하고 채점받기'; return; }
+
+    document.getElementById('content-area').innerHTML = `
+      <h1>채점 결과</h1>
+      <div class="card center">
+        <p class="muted">${name}님</p>
+        <div class="score-badge ${res.total && res.score === res.total ? 'pass' : 'fail'}" style="font-size:30px; padding:10px 28px;">
+          ${res.total ? to100(res.score, res.total) + '점' : '객관식 없음'}
+        </div>
+        <p class="hint" style="margin-top:8px;">${res.total ? '객관식 ' + res.total + '문항 중 ' + res.score + '개 정답 · 100점 만점 환산' : ''}</p>
+        ${(res.subjective && res.subjective.length) ? '<p class="hint" style="margin-top:4px;">주관식 ' + res.subjective.length + '문항(' + res.subjective.join(', ') + '번)은 점수에 합산하지 않아요. 선생님이 따로 채점해요.</p>' : ''}
+      </div>
+      ${res.explUrl ? '<a class="btn primary" href="' + res.explUrl + '" target="_blank" style="width:100%;">📝 해설지 보기</a>' : ''}
+      <h2>문항별 정답</h2>
+      <div class="card">
+        ${res.correctAnswers.map((ans, i) => String(ans) === '-' ? `
+          <div class="submission-row" style="color:#9CA3AF; background:#F3F4F6;">
+            <span>${i + 1}번</span>
+            <span>주관식 (자동 채점 제외)</span>
+          </div>` : `
+          <div class="submission-row">
+            <span>${i + 1}번</span>
+            <span>내 답: ${res.studentAnswers[i]} · 정답: ${ans} ${String(res.studentAnswers[i]) === String(ans) ? '✅' : '❌'}</span>
+          </div>`).join('')}
+      </div>
+    `;
+  } catch (err) {
+    alert('오류가 발생했어요: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = '제출하고 채점받기';
+  }
+}
+
+loadExam();
+</script>
+</body>
+</html>

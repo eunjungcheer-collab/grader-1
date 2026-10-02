@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#C1392B">
+<title>문제은행 - 자동 채점 시스템</title>
+<link rel="stylesheet" href="css/style.css?v=202609290852">
+</head>
+<body>
+<template id="page-content">
+  <span class="backlink"><a href="index.html">← 홈으로</a></span>
+  <h1>문제은행</h1>
+  <p class="muted" id="total-text">불러오는 중...</p>
+  <div class="actions">
+    <a class="btn primary" href="bank_upload.html">📄 PDF에서 문항 가져오기</a>
+    <a class="btn outline" href="bank_compose.html">🧩 시험 조합하기</a>
+  </div>
+  <div class="search-bar">
+    <input type="text" id="q" placeholder="단원명 또는 문항 내용으로 검색">
+  </div>
+  <div id="bulk-bar" class="bulk-bar">
+    <label class="bank-include-label" style="margin:0;"><input type="checkbox" id="select-all-page"> 이 페이지 전체 선택</label>
+    <span class="hint" id="select-count" style="margin:0;">0개 선택</span>
+    <button type="button" class="btn danger" id="bulk-delete-btn" style="padding:8px 14px;" disabled>선택 삭제</button>
+  </div>
+  <label class="bank-include-label" style="margin:6px 0;"><input type="checkbox" id="only-noans"> 정답이 비어있는 문항만 보기</label>
+  <div style="margin:8px 0;"><button type="button" class="btn outline" id="auto-classify" style="padding:8px 14px;">🤖 난이도 미정 문항 자동 분류 (문제집별 상대평가)</button> <span class="hint" id="auto-msg"></span></div>
+  <div id="diff-chips" style="display:flex; flex-wrap:wrap; gap:6px; margin:6px 0;"></div>
+  <div id="unit-chips" style="display:flex; flex-wrap:wrap; gap:6px; margin:10px 0;"></div>
+  <p class="hint">💡 문항 밑의 붉은 점선 칸이 저장된 해설의 맨 윗부분이에요(정답 표시가 보여요). 클릭하면 해설 전체가 펼쳐져요. 정답칸에 숫자를 치면 자동 저장되고 다음 문항으로 넘어가요.</p>
+  <div id="list" class="qcard-grid"></div>
+  <div id="save-status" class="save-status" style="display:none;"></div>
+  <div id="pager" class="sort-bar" style="justify-content:center;"></div>
+</template>
+
+<script src="js/config.js?v=202609290852"></script>
+<script src="js/api.js?v=202609290852"></script>
+<script src="js/common.js?v=202609290852"></script>
+<script src="js/pdfui.js?v=202609290852"></script>
+<script>
+requireLogin();
+renderHeader({ wide: true });
+const $ = id => document.getElementById(id);
+const PER_PAGE = 12;
+let all = [], unitFilter = '', diffFilter = '', page = 1;
+const selected = new Set();
+const dKey = q => q.difficulty || '미정';
+
+async function load() {
+  try {
+    const res = await callApi('listQuestions', { password: getTeacherPassword() });
+    if (!res.ok) { $('total-text').textContent = res.error; return; }
+    all = res.questions.slice().reverse();
+    render();
+  } catch (e) { $('total-text').textContent = '서버에 연결할 수 없어요.'; }
+}
+
+
+// ───────── 저장 대기열 ─────────
+// 정답·난이도를 바꿀 때마다 서버(구글시트)를 부르고 기다리면 한 칸마다 1~3초씩 멈춰요.
+// 그래서 화면은 바로 다음으로 넘어가고, 바뀐 것들을 모아서 뒤에서 한 번에 저장해요.
+const pending = {};            // id -> {answer?, difficulty?}
+let flushTimer = null, inflight = 0, lastFail = false;
+const pendingCount = () => Object.keys(pending).length;
+function paintStatus() {
+  const el = $('save-status'), n = pendingCount() + inflight;
+  if (lastFail) { el.style.display = 'block'; el.className = 'save-status fail'; el.textContent = '⚠️ 저장이 안 됐어요. 다시 시도하는 중... (' + n + '건)'; }
+  else if (n) { el.style.display = 'block'; el.className = 'save-status'; el.textContent = '💾 저장 중... ' + n + '건'; }
+  else { el.style.display = 'block'; el.className = 'save-status ok'; el.textContent = '✓ 모두 저장됨'; setTimeout(() => { if (!pendingCount() && !inflight) el.style.display = 'none'; }, 2500); }
+}
+function markCard(id, text) {
+  const el = document.querySelector('.qcard[data-id="' + id + '"] .saved-flash');
+  if (el) el.textContent = text;
+}
+function queueUpdate(id, patch) {
+  pending[id] = Object.assign(pending[id] || {}, patch);
+  markCard(id, '저장 대기…');
+  paintStatus();
+  clearTimeout(flushTimer);
+  flushTimer = setTimeout(flush, 600);            // 입력이 0.6초 멈추면 모아서 보냄
+}
+async function flush() {
+  clearTimeout(flushTimer);
+  if (inflight) { flushTimer = setTimeout(flush, 300); return; }     // 한 번에 하나씩만 보내서 순서가 꼬이지 않게
+  const ids = Object.keys(pending);
+  if (!ids.length) return;
+  const updates = ids.map(id => Object.assign({ id: id }, pending[id]));
+  ids.forEach(id => delete pending[id]);
+  inflight = updates.length;
+  paintStatus();
+  try {
+    const r = await callApi('updateQuestions', { password: getTeacherPassword(), updates: updates });
+    if (!r.ok) throw new Error(r.error || '저장 실패');
+    lastFail = false;
+    updates.forEach(u => markCard(u.id, '저장됨 ✓'));
+  } catch (e) {
+    lastFail = true;
+    updates.forEach(u => { const p = Object.assign({}, u); delete p.id; pending[u.id] = Object.assign(p, pending[u.id] || {}); markCard(u.id, '저장 실패…'); });
+    flushTimer = setTimeout(flush, 3000);
+  }
+  inflight = 0;
+  paintStatus();
+  if (pendingCount() && !lastFail) flushTimer = setTimeout(flush, 300);
+}
+window.addEventListener('beforeunload', e => { if (pendingCount() || inflight) { e.preventDefault(); e.returnValue = ''; } });
+document.addEventListener('visibilitychange', () => { if (document.hidden && pendingCount()) flush(); });
+
+function filtered() {
+  const q = $('q').value.trim().toLowerCase();
+  const onlyNo = $('only-noans').checked;
+  return all.filter(x => (!unitFilter || x.unit === unitFilter) && (!diffFilter || dKey(x) === diffFilter) &&
+    (!onlyNo || !String(x.answer).trim()) &&
+    (!q || String(x.unit).toLowerCase().includes(q) || String(x.textPreview).toLowerCase().includes(q)));
+}
+
+function render() {
+  const noAnsTotal = all.filter(x => !String(x.answer).trim()).length;
+  $('total-text').textContent = '총 ' + all.length + '문항이 저장되어 있어요.' + (noAnsTotal ? ' (정답이 비어있는 문항 ' + noAnsTotal + '개)' : '');
+  const dc = { '상': 0, '중': 0, '하': 0, '미정': 0 };
+  all.filter(x => !unitFilter || x.unit === unitFilter).forEach(x => dc[dKey(x)]++);
+  $('diff-chips').innerHTML = '<span class="muted" style="align-self:center; font-weight:700;">난이도</span>' +
+    '<button class="sort-btn ' + (diffFilter ? '' : 'active') + '" data-d="">전체</button>' +
+    ['상', '중', '하', '미정'].map(d => '<button class="sort-btn ' + (diffFilter === d ? 'active' : '') + '" data-d="' + d + '">' + d + ' (' + dc[d] + ')</button>').join('');
+  $('diff-chips').querySelectorAll('button').forEach(b => b.addEventListener('click', () => { diffFilter = b.dataset.d; page = 1; render(); }));
+  const counts = {};
+  all.forEach(x => counts[x.unit] = (counts[x.unit] || 0) + 1);
+  const units = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+  $('unit-chips').innerHTML =
+    '<button class="sort-btn ' + (unitFilter ? '' : 'active') + '" data-u="">전체</button>' +
+    units.map(u => '<button class="sort-btn ' + (unitFilter === u ? 'active' : '') + '" data-u="' + escapeHtml(u) + '">' + escapeHtml(u) + ' (' + counts[u] + ')</button>').join('');
+  $('unit-chips').querySelectorAll('button').forEach(b => b.addEventListener('click', () => { unitFilter = b.dataset.u; page = 1; render(); }));
+
+  const list = filtered();
+  const pages = Math.max(1, Math.ceil(list.length / PER_PAGE));
+  page = Math.min(page, pages);
+  const slice = list.slice((page - 1) * PER_PAGE, page * PER_PAGE);
+  $('list').innerHTML = slice.length ? slice.map(x => `
+    <div class="qcard" data-id="${x.id}">
+      <label class="qcard-select"><input type="checkbox" class="qsel" data-id="${x.id}"> <span class="hint">선택</span></label>
+      <img class="qimg" src="${driveThumb(x.fileId, 900)}" data-full="${driveThumb(x.fileId, 1600)}" loading="lazy" title="누르면 크게 보여요">
+      ${x.explFileId ? '<div class="expl-peek"><span class="peek-tag">해설 · 클릭해서 펼치기</span><img src="' + driveThumb(x.explFileId, 900) + '" loading="lazy"></div>' : ''}
+      <div class="diffrow"><b style="font-size:13px;">난이도</b>
+        <div class="seg" data-id="${x.id}">${['상', '중', '하'].map(d => '<button type="button" data-d="' + d + '" class="' + (x.difficulty === d ? 'on' : '') + '">' + d + '</button>').join('')}</div>
+        <span class="saved-flash dflash"></span></div>
+      <div class="qedit">
+        <input type="text" class="u" value="${escapeHtml(x.unit)}" title="단원">
+        <span class="muted" style="font-weight:700;">정답</span>
+        <input type="text" class="a big-ans ${String(x.answer).trim() ? '' : 'empty'}" value="${escapeHtml(x.answer)}" maxlength="1" inputmode="numeric">
+        <label class="sub-chk" title="주관식이면 체크 — 자동 채점에서 빠져요"><input type="checkbox" class="subchk"> 주관식</label>
+        <span class="saved-flash"></span>
+      </div>
+      <div class="qbtns">
+        <button class="btn ghost save">단원 수정 저장</button>
+        <button class="btn danger del">삭제</button>
+      </div>
+    </div>`).join('') : '<div class="card center muted">해당하는 문항이 없어요.</div>';
+
+  const cards = Array.from($('list').querySelectorAll('.qcard'));
+  cards.forEach((el, idx) => {
+    const id = el.dataset.id;
+    const flash = el.querySelector('.saved-flash');
+    const ansInput = el.querySelector('.a');
+    el.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
+      const q = all.find(z => z.id === id);
+      const nd = q.difficulty === b.dataset.d ? '' : b.dataset.d;
+      q.difficulty = nd;
+      el.querySelectorAll('.seg button').forEach(x => x.classList.toggle('on', x.dataset.d === nd));
+      queueUpdate(id, { difficulty: nd });
+    }));
+    el.querySelectorAll('.qimg').forEach(im => im.addEventListener('click', () => zoomImg(im.dataset.full)));
+    el.querySelectorAll('.expl-peek').forEach(pk => pk.addEventListener('click', () => pk.classList.toggle('open')));
+
+    const subchk = el.querySelector('.subchk');
+    const nextInput = (from, dir) => { for (let j = from + dir; j >= 0 && j < cards.length; j += dir) { const c = cards[j].querySelector('.a'); if (c && !c.disabled) return c; } return null; };
+    const saveAnswer = (val) => { const q = all.find(z => z.id === id); q.answer = val; queueUpdate(id, { answer: val }); };
+    if (String(all.find(z => z.id === id).answer) === '-') { setSubjective(ansInput, true, el); subchk.checked = true; ansInput.classList.remove('empty'); }
+    subchk.addEventListener('change', () => {
+      setSubjective(ansInput, subchk.checked, el);
+      ansInput.classList.toggle('empty', !subchk.checked);
+      saveAnswer(subchk.checked ? '-' : '');
+      if (!subchk.checked) ansInput.focus();
+    });
+    ansInput.addEventListener('focus', () => ansInput.select());
+    ansInput.addEventListener('input', () => {
+      ansInput.value = ansInput.value.replace(/[^0-9\-]/g, '').slice(-1);
+      if (!ansInput.value) return;
+      flashBigNumber(ansInput.value);
+      if (ansInput.value === '-') { setSubjective(ansInput, true, el); subchk.checked = true; }
+      ansInput.classList.remove('empty');
+      saveAnswer(ansInput.value);                       // 서버 응답을 기다리지 않고 바로 다음 칸으로
+      const next = nextInput(idx, 1);
+      if (next) { next.focus(); next.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+    });
+    ansInput.addEventListener('keydown', e => {
+      if (e.key === 'ArrowDown' || e.key === 'Enter') { e.preventDefault(); const n = nextInput(idx, 1); if (n) n.focus(); }
+      if (e.key === 'ArrowUp') { e.preventDefault(); const n = nextInput(idx, -1); if (n) n.focus(); }
+    });
+    el.querySelector('.save').addEventListener('click', async () => {
+      const unit = el.querySelector('.u').value.trim();
+      const res = await callApi('updateQuestion', { password: getTeacherPassword(), id: id, unit: unit });
+      if (res.ok) { const q = all.find(x => x.id === id); q.unit = unit; render(); } else alert(res.error);
+    });
+    el.querySelector('.del').addEventListener('click', async () => {
+      if (!confirm('이 문항을 삭제할까요?')) return;
+      const res = await callApi('deleteQuestion', { password: getTeacherPassword(), id: id });
+      if (res.ok) { all = all.filter(x => x.id !== id); selected.delete(id); render(); } else alert(res.error);
+    });
+  });
+
+  // ── 일괄 선택/삭제 ──
+  document.querySelectorAll('.qsel').forEach(cb => {
+    cb.checked = selected.has(cb.dataset.id);
+    cb.addEventListener('change', () => {
+      if (cb.checked) selected.add(cb.dataset.id); else selected.delete(cb.dataset.id);
+      updateBulkBar();
+    });
+  });
+  updateBulkBar();
+
+  $('pager').innerHTML = pages > 1 ?
+    (page > 1 ? '<button class="sort-btn" id="prev">← 이전</button>' : '') +
+    '<span class="sort-btn active">' + page + ' / ' + pages + '</span>' +
+    (page < pages ? '<button class="sort-btn" id="next">다음 →</button>' : '') : '';
+  if ($('prev')) $('prev').addEventListener('click', () => { page--; render(); window.scrollTo(0, 0); });
+  if ($('next')) $('next').addEventListener('click', () => { page++; render(); window.scrollTo(0, 0); });
+}
+
+
+function updateBulkBar() {
+  const onPage = Array.from(document.querySelectorAll('.qsel'));
+  const checkedOnPage = onPage.filter(cb => selected.has(cb.dataset.id));
+  $('select-all-page').checked = onPage.length > 0 && checkedOnPage.length === onPage.length;
+  $('select-count').textContent = selected.size + '개 선택';
+  $('bulk-delete-btn').disabled = selected.size === 0;
+}
+$('select-all-page').addEventListener('change', () => {
+  const onPage = Array.from(document.querySelectorAll('.qsel'));
+  onPage.forEach(cb => { cb.checked = $('select-all-page').checked; if (cb.checked) selected.add(cb.dataset.id); else selected.delete(cb.dataset.id); });
+  updateBulkBar();
+});
+$('bulk-delete-btn').addEventListener('click', async () => {
+  const ids = Array.from(selected);
+  if (!ids.length) return;
+  if (!confirm(ids.length + '개 문항을 한꺼번에 삭제할까요? 되돌릴 수 없어요.')) return;
+  $('bulk-delete-btn').disabled = true;
+  $('bulk-delete-btn').textContent = '삭제 중...';
+  try {
+    const res = await callApi('deleteQuestions', { password: getTeacherPassword(), ids: ids });
+    if (!res.ok) throw new Error(res.error || '삭제 실패');
+    all = all.filter(x => !selected.has(x.id));
+    selected.clear();
+    render();
+  } catch (e) { alert('삭제 중 오류: ' + e.message); }
+  $('bulk-delete-btn').textContent = '선택 삭제';
+});
+
+$('auto-classify').addEventListener('click', async () => {
+  const targets = all.filter(x => !x.difficulty && x.diffScore !== null && x.diffScore !== undefined);
+  if (!targets.length) { $('auto-msg').textContent = '자동 분류할 문항이 없어요. (난이도 점수가 저장된 미정 문항만 분류돼요. 예전에 저장한 문항은 PDF를 다시 가져와야 해요.)'; return; }
+  if (!confirm('난이도가 비어있는 ' + targets.length + '문항을 문제집(파일)별로 상 30% · 중 40% · 하 30%로 나눠서 채울까요?\n(이미 난이도를 정한 문항은 건드리지 않아요)')) return;
+  const bySrc = {};
+  all.forEach(x => { if (x.diffScore !== null && x.diffScore !== undefined) (bySrc[x.source] = bySrc[x.source] || []).push(x); });
+  const updates = [];
+  Object.values(bySrc).forEach(list => {
+    if (list.length < 3) return;
+    const res = list.map(x => x.diffScore);
+    const sorted = res.map((v, i) => [v, i]).sort((a, b) => a[0] - b[0]);
+    const n = list.length, lo = Math.round(n * 0.3), hi = n - Math.round(n * 0.3);
+    sorted.forEach((pair, r) => {
+      const q = list[pair[1]];
+      if (q.difficulty) return;
+      q.difficulty = r < lo ? '하' : (r >= hi ? '상' : '중');
+      updates.push({ id: q.id, difficulty: q.difficulty });
+    });
+  });
+  $('auto-msg').textContent = '저장 중...';
+  try {
+    for (let i = 0; i < updates.length; i += 40) await callApi('updateQuestions', { password: getTeacherPassword(), updates: updates.slice(i, i + 40) });
+    $('auto-msg').textContent = '✅ ' + updates.length + '문항에 난이도를 채웠어요.';
+  } catch (e) { $('auto-msg').textContent = '저장 중 오류가 났어요.'; }
+  render();
+});
+$('q').addEventListener('input', () => { page = 1; render(); });
+$('only-noans').addEventListener('change', () => { page = 1; render(); });
+load();
+</script>
+</body>
+</html>

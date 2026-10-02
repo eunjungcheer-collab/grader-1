@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#C1392B">
+<title>시험 조합 - 자동 채점 시스템</title>
+<link rel="stylesheet" href="css/style.css?v=202609290852">
+</head>
+<body>
+<template id="page-content">
+  <span class="backlink"><a href="bank_list.html">← 문제은행</a></span>
+  <h1>문제은행에서 새 시험 조합하기</h1>
+  <p class="muted">단원을 고르면 그 범위의 문항으로 새 시험지를 만들고, QR코드와 정답이 자동으로 등록돼요.</p>
+  <div id="error-banner"></div>
+  <div id="content" class="muted">불러오는 중...</div>
+</template>
+
+<script src="js/vendor/qrcode.min.js?v=202609290852"></script>
+<script src="js/vendor/pdf-lib.min.js?v=202609290852"></script>
+<script src="js/config.js?v=202609290852"></script>
+<script src="js/api.js?v=202609290852"></script>
+<script src="js/common.js?v=202609290852"></script>
+<script src="js/bankcore.js?v=202609290852"></script>
+<script src="js/pdfui.js?v=202609290852"></script>
+<script>
+requireLogin();
+renderHeader();
+const $ = id => document.getElementById(id);
+let groups = {};
+
+
+// ───────── 문항 구성 프리셋 ─────────
+const DEFAULT_PRESETS = { '기초': { '상': 10, '중': 50, '하': 40 }, '기본': { '상': 20, '중': 50, '하': 30 }, '심화': { '상': 30, '중': 50, '하': 20 } };
+let presets = JSON.parse(JSON.stringify(DEFAULT_PRESETS));
+let curPreset = null;
+const DIFFS = ['상', '중', '하'];
+const FALLBACK = { '상': ['중', '하'], '중': ['상', '하'], '하': ['중', '상'] };
+
+// 전체 개수 N을 비율(합이 100이 아니어도 됨)대로 나눈다. 소수점은 가장 큰 나머지부터 올려서 합이 N이 되게 한다.
+function allocate(N, pct) {
+  const sum = DIFFS.reduce((a, d) => a + (Number(pct[d]) || 0), 0);
+  if (!(N > 0) || !(sum > 0)) return { '상': 0, '중': 0, '하': 0 };
+  const raw = DIFFS.map(d => N * (Number(pct[d]) || 0) / sum);
+  const base = raw.map(Math.floor);
+  let left = N - base.reduce((a, b) => a + b, 0);
+  const order = DIFFS.map((d, i) => ({ i: i, frac: raw[i] - base[i], tie: ['중', '하', '상'].indexOf(d) }))
+    .sort((a, b) => (b.frac - a.frac) || (a.tie - b.tie));
+  for (let k = 0; left > 0; k = (k + 1) % 3, left--) base[order[k].i]++;
+  return { '상': base[0], '중': base[1], '하': base[2] };
+}
+
+function refreshPresetUI() {
+  document.querySelectorAll('.preset-btn').forEach(b => b.classList.toggle('on', b.dataset.p === curPreset));
+  const info = $('preset-info');
+  if (!curPreset) { info.textContent = '프리셋: ' + Object.keys(presets).map(n => n + '(상 ' + presets[n]['상'] + '·중 ' + presets[n]['중'] + '·하 ' + presets[n]['하'] + ')').join(' / '); return; }
+  const pc = presets[curPreset], sum = pc['상'] + pc['중'] + pc['하'];
+  const N = parseInt($('total').value, 10);
+  let t = curPreset + ' = 상 ' + pc['상'] + '% · 중 ' + pc['중'] + '% · 하 ' + pc['하'] + '%';
+  if (sum !== 100) t += ' (합이 ' + sum + '%라서 비율로 환산)';
+  t += N > 0 ? ' → 전체 ' + N + '문항 기준으로 아래 개수를 채웠어요.' : ' — 위의 전체 문항 수를 입력하면 개수가 계산돼요.';
+  info.textContent = t;
+}
+function applyPreset() {
+  if (!curPreset) { refreshPresetUI(); return; }
+  const N = parseInt($('total').value, 10);
+  const c = allocate(N, presets[curPreset]);
+  DIFFS.forEach(d => { $('n-' + d).value = N > 0 ? c[d] : ''; });
+  refreshPresetUI();
+}
+function fillEditor() {
+  document.querySelectorAll('#preset-editor tr[data-p]').forEach(tr => {
+    const n = tr.dataset.p;
+    tr.querySelectorAll('.pe').forEach(inp => { inp.value = presets[n][inp.dataset.k]; });
+    updateSum(tr);
+  });
+}
+function updateSum(tr) {
+  const v = Array.from(tr.querySelectorAll('.pe')).reduce((a, i) => a + (parseInt(i.value, 10) || 0), 0);
+  const cell = tr.querySelector('.pe-sum');
+  cell.innerHTML = v === 100 ? '100' : '<span class="preset-warn">' + v + '</span>';
+}
+function setupPresets() {
+  document.querySelectorAll('.preset-btn').forEach(b => b.addEventListener('click', () => {
+    curPreset = curPreset === b.dataset.p ? null : b.dataset.p;
+    if (!curPreset) DIFFS.forEach(d => { $('n-' + d).value = ''; });
+    applyPreset();
+  }));
+  $('total').addEventListener('input', applyPreset);
+  DIFFS.forEach(d => $('n-' + d).addEventListener('input', () => { curPreset = null; refreshPresetUI(); }));
+  $('preset-edit-btn').addEventListener('click', () => {
+    const ed = $('preset-editor');
+    ed.style.display = ed.style.display === 'none' ? 'block' : 'none';
+    if (ed.style.display === 'block') fillEditor();
+  });
+  document.querySelectorAll('#preset-editor .pe').forEach(inp => inp.addEventListener('input', () => updateSum(inp.closest('tr'))));
+  $('preset-save').addEventListener('click', async () => {
+    const next = {};
+    document.querySelectorAll('#preset-editor tr[data-p]').forEach(tr => {
+      next[tr.dataset.p] = {};
+      tr.querySelectorAll('.pe').forEach(i => { next[tr.dataset.p][i.dataset.k] = Math.max(0, parseInt(i.value, 10) || 0); });
+    });
+    const bad = Object.keys(next).find(n => DIFFS.every(d => next[n][d] === 0));
+    if (bad) { $('preset-msg').textContent = ' ' + bad + ': 모두 0이에요. 숫자를 넣어주세요.'; return; }
+    presets = next;
+    $('preset-msg').textContent = ' 저장 중...';
+    try {
+      const r = await callApi('setPresets', { password: getTeacherPassword(), presets: next });
+      $('preset-msg').textContent = r.ok ? ' ✅ 저장했어요 (다른 컴퓨터에서도 같아요)' : (' 저장 실패: ' + r.error);
+    } catch (e) { $('preset-msg').textContent = ' 서버에 저장하지 못했어요 (이 화면에서만 적용돼요)'; }
+    applyPreset();
+  });
+  $('preset-reset').addEventListener('click', () => { presets = JSON.parse(JSON.stringify(DEFAULT_PRESETS)); fillEditor(); $('preset-msg').textContent = ' 처음 값으로 되돌렸어요. 저장을 눌러야 서버에 반영돼요.'; applyPreset(); });
+  // 서버에 저장된 값이 있으면 불러온다
+  callApi('getPresets', { password: getTeacherPassword() }).then(r => {
+    if (r.ok && r.presets) {
+      Object.keys(r.presets).forEach(n => { if (presets[n]) presets[n] = r.presets[n]; });
+      applyPreset();
+    }
+  }).catch(() => {});
+  refreshPresetUI();
+}
+
+const dKey = q => q.difficulty || '미정';
+let excludeIds = new Set();   // "겹치지 않게"로 뺄 문항 id들 (유사 시험지 만들기)
+let regenFrom = null;         // 원본 시험 정보(복습 재구성 때 안내 문구에 씀)
+
+function poolFor(u) {
+  let p = groups[u] || [];
+  const chk = $('exclude-prev');
+  if (chk && chk.checked && excludeIds.size) p = p.filter(q => !excludeIds.has(q.id));
+  return p;
+}
+function showAvail() {
+  const units = Array.from(document.querySelectorAll('.use:checked')).map(c => c.dataset.u);
+  const c = { '상': 0, '중': 0, '하': 0, '미정': 0 };
+  let nSub = 0, nExcluded = 0;
+  units.forEach(u => {
+    groups[u].forEach(q => { if (excludeIds.has(q.id)) nExcluded++; });
+    poolFor(u).forEach(q => { c[dKey(q)]++; if (q.answer === '-') nSub++; });
+  });
+  let t = units.length ? '선택한 단원의 보유 문항 → 상 ' + c['상'] + ' · 중 ' + c['중'] + ' · 하 ' + c['하'] + ' · 난이도 미정 ' + c['미정'] : '단원을 선택하면 난이도별 보유 개수가 보여요.';
+  if (nSub) t += ' (이 중 주관식 ' + nSub + '개 — 시험에 들어가면 회색으로 표시되고 자동 채점에서 빠져요)';
+  if (nExcluded) t += ' · 겹치지 않게 제외됨 ' + nExcluded + '개';
+  $('diff-avail').textContent = t;
+}
+function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+
+async function loadRegenParams() {
+  const params = new URLSearchParams(location.search);
+  const regenId = params.get('regen') || params.get('excludeExam');
+  const unitsParam = params.get('units');
+  let presetUnits = null;
+  if (unitsParam) { try { presetUnits = JSON.parse(decodeURIComponent(unitsParam)); } catch (e) {} }
+  if (regenId) {
+    try {
+      const d = await callApi('getExamDetail', { password: getTeacherPassword(), id: regenId });
+      if (d.ok) {
+        if (d.sourceQuestionIds && d.sourceQuestionIds.length) excludeIds = new Set(d.sourceQuestionIds);
+        regenFrom = { id: regenId, title: d.title, recipe: d.composeRecipe, hadSource: !!(d.sourceQuestionIds && d.sourceQuestionIds.length) };
+      }
+    } catch (e) {}
+  }
+  return presetUnits;
+}
+
+(async function () {
+  try {
+    const res = await callApi('listQuestions', { password: getTeacherPassword() });
+    if (!res.ok) { $('content').innerHTML = '<div class="banner error">' + escapeHtml(res.error) + '</div>'; return; }
+    res.questions.forEach(q => (groups[q.unit] = groups[q.unit] || []).push(q));
+    const units = Object.keys(groups).sort((a, b) => groups[b].length - groups[a].length);
+    if (!units.length) { $('content').innerHTML = '<div class="card center muted">문제은행에 문항이 없어요. 먼저 <a href="bank_upload.html">PDF에서 문항을 가져와</a> 주세요.</div>'; return; }
+
+    const presetUnits = await loadRegenParams();
+
+    // 특정 문항 id들을 바로 받아서(유사 오답 문제 등) 선택 화면 없이 검토 화면으로 직행
+    const directParams = new URLSearchParams(location.search);
+    const directIdsRaw = directParams.get('directIds');
+    if (directIdsRaw) {
+      let ids = [];
+      try { ids = JSON.parse(decodeURIComponent(directIdsRaw)); } catch (e) {}
+      const byId = {}; res.questions.forEach(q => byId[q.id] = q);
+      const picks = ids.map(id => byId[id]).filter(Boolean);
+      const title = directParams.get('title') ? decodeURIComponent(directParams.get('title')) : '유사 문항 모음';
+      $('content').className = '';
+      $('content').innerHTML = '<div id="review-area"></div>';
+      if (!picks.length) {
+        $('content').innerHTML = '<div class="card center muted">비슷한 문항을 찾지 못했어요. 문제은행에 아직 관련 문항이 없을 수 있어요.</div>';
+        return;
+      }
+      showReview(title, picks, null);
+      return;
+    }
+
+    $('content').className = '';
+    $('content').innerHTML = `
+      ${regenFrom ? `<div class="banner" style="margin-bottom:14px;">
+          🔁 <b>"${escapeHtml(regenFrom.title)}"</b>${regenFrom.recipe ? '와 비슷한 시험' : '에서 쓴 문항'}을 바탕으로 만들어요.
+          ${regenFrom.hadSource ? '<label class="bank-include-label" style="margin-top:6px;"><input type="checkbox" id="exclude-prev" checked> 기존 시험과 겹치지 않게 (이미 낸 문항은 빼고 고르기)</label>' : '<p class="hint" style="margin:4px 0 0;">이 시험은 예전 버전으로 만들어져서 "겹치지 않게" 옵션은 못 써요. 문항은 겹칠 수 있어요.</p>'}
+        </div>` : ''}
+      <div class="card">
+        <label>시험지 이름</label>
+        <input type="text" id="title" placeholder="예: 중3 과학 1단원 모음고사" value="${regenFrom ? escapeHtml(regenFrom.title) + ' (유사)' : ''}">
+        <label class="field-label-spaced">단원 선택 (개수를 비워두면 그 단원 문항을 모두 사용해요)</label>
+        <div class="bank-compose-units">
+          ${units.map((u, i) => {
+            const noAns = groups[u].filter(q => !q.answer).length;
+            const nSub = groups[u].filter(q => q.answer === '-').length;
+            const checked = presetUnits ? (u in presetUnits) : (regenFrom && regenFrom.recipe && regenFrom.recipe.units ? regenFrom.recipe.units.includes(u) : false);
+            const cntVal = presetUnits ? (presetUnits[u] || '') : (regenFrom && regenFrom.recipe && regenFrom.recipe.mode === 'count' && regenFrom.recipe.perUnit ? (regenFrom.recipe.perUnit[u] || '') : '');
+            return `<div class="bank-compose-unit-row">
+              <label class="bank-include-label"><input type="checkbox" class="use" data-u="${escapeHtml(u)}" ${checked ? 'checked' : ''}> ${escapeHtml(u)}
+                <span class="muted" style="font-weight:400;">(${groups[u].length}문항${nSub ? ', 주관식 ' + nSub : ''}${noAns ? ', 정답없음 ' + noAns : ''})</span></label>
+              <input type="text" class="cnt bank-answer-input" data-u="${escapeHtml(u)}" placeholder="개수" value="${escapeHtml(String(cntVal))}">
+            </div>`; }).join('')}
+        </div>
+        <p class="hint">아래 "전체 문항 수"를 입력하면, 단원별 개수 대신 선택한 단원들에서 고르게 자동으로 뽑아요.</p>
+        <label>전체 문항 수 (선택)</label>
+        <input type="text" id="total" placeholder="예: 20" value="${regenFrom && regenFrom.recipe && regenFrom.recipe.total ? regenFrom.recipe.total : ''}">
+        <label class="field-label-spaced">난이도 구성 (선택)</label>
+        <p class="hint">프리셋을 누르면 위의 <b>전체 문항 수</b>에 맞춰 상·중·하 개수가 자동 계산돼요. 아래 개수는 직접 고쳐도 돼요. 개수를 정하면 <b>선택한 단원들 전체에서</b> 난이도별로 뽑고, 위의 단원별 개수는 무시돼요.</p>
+        <div class="preset-row">
+          <b style="font-size:13px;">문항 구성</b>
+          <button type="button" class="preset-btn" data-p="기초">기초</button>
+          <button type="button" class="preset-btn" data-p="기본">기본</button>
+          <button type="button" class="preset-btn" data-p="심화">심화</button>
+          <button type="button" class="btn ghost" id="preset-edit-btn" style="padding:7px 12px;">⚙ 비율 수정</button>
+        </div>
+        <div id="preset-info" class="hint"></div>
+        <div id="preset-editor" class="preset-editor" style="display:none;">
+          <table>
+            <tr><th></th><th><span class="diff-tag d-상">상 %</span></th><th><span class="diff-tag d-중">중 %</span></th><th><span class="diff-tag d-하">하 %</span></th><th>합계</th></tr>
+            ${['기초', '기본', '심화'].map(n => `<tr data-p="${n}"><td><b>${n}</b></td>
+              <td><input type="text" class="pe" data-k="상" inputmode="numeric"></td>
+              <td><input type="text" class="pe" data-k="중" inputmode="numeric"></td>
+              <td><input type="text" class="pe" data-k="하" inputmode="numeric"></td>
+              <td class="pe-sum"></td></tr>`).join('')}
+          </table>
+          <p class="hint">합이 100이 아니면 그 비율로 환산해서 적용해요. (예: 30·40·20 → 상 33% · 중 44% · 하 22%)</p>
+          <button type="button" class="btn primary" id="preset-save" style="padding:8px 14px;">저장</button>
+          <button type="button" class="btn ghost" id="preset-reset" style="padding:8px 14px;">처음 값으로</button>
+          <span class="hint" id="preset-msg"></span>
+        </div>
+        <div class="diff-inputs">
+          <span class="diff-tag d-상">상</span><input type="text" id="n-상" placeholder="0" inputmode="numeric" value="${regenFrom && regenFrom.recipe && regenFrom.recipe.diffCounts ? regenFrom.recipe.diffCounts['상'] || '' : ''}">
+          <span class="diff-tag d-중">중</span><input type="text" id="n-중" placeholder="0" inputmode="numeric" value="${regenFrom && regenFrom.recipe && regenFrom.recipe.diffCounts ? regenFrom.recipe.diffCounts['중'] || '' : ''}">
+          <span class="diff-tag d-하">하</span><input type="text" id="n-하" placeholder="0" inputmode="numeric" value="${regenFrom && regenFrom.recipe && regenFrom.recipe.diffCounts ? regenFrom.recipe.diffCounts['하'] || '' : ''}">
+        </div>
+        <div id="diff-avail" class="hint"></div>
+        <label class="bank-include-label" style="margin:4px 0;"><input type="checkbox" id="fill-short" checked> 어떤 난이도 문항이 모자라면 가까운 난이도로 채우기</label>
+        <p class="hint" style="margin-bottom:2px;">난이도 개수를 안 정할 때, 뽑을 난이도 범위:</p>
+        <div style="display:flex; gap:14px; flex-wrap:wrap;">
+          ${['상', '중', '하', '미정'].map(d => '<label class="bank-include-label"><input type="checkbox" class="dfilter" value="' + d + '" checked> ' + d + '</label>').join('')}
+        </div>
+        <label class="bank-include-label field-label-spaced"><input type="checkbox" id="easy-first" checked> 쉬운 문항부터 배치 (하 → 중 → 상)</label>
+        <label class="bank-include-label"><input type="checkbox" id="shuffle"> 문항 순서 섞기 (위 배치보다 우선)</label>
+        <label class="bank-include-label" style="margin-top:8px;"><input type="checkbox" id="make-expl" checked> 해설지도 함께 만들기 (시험지 뒤에 이어붙여서 한 PDF로)</label>
+        <button type="button" class="btn primary" id="go-btn" style="width:100%; margin-top:18px;">문항 고르기 → 검토</button>
+      </div>
+      <div id="review-area" style="display:none;"></div>`;
+    $('go-btn').addEventListener('click', buildPicksAndReview);
+    document.querySelectorAll('.use').forEach(c => c.addEventListener('change', showAvail));
+    const excludeChk = $('exclude-prev');
+    if (excludeChk) excludeChk.addEventListener('change', showAvail);
+    showAvail();
+    setupPresets();
+  } catch (e) { $('content').innerHTML = '<div class="banner error">서버에 연결할 수 없어요.</div>'; }
+})();
+
+// ── 1단계: 조건에 맞는 문항 고르기 ──
+function buildPicksAndReview() {
+  const err = $('error-banner');
+  err.innerHTML = '';
+  const title = $('title').value.trim();
+  if (!title) { err.innerHTML = '<div class="banner error">시험지 이름을 입력해주세요.</div>'; return; }
+  const units = Array.from(document.querySelectorAll('.use:checked')).map(c => c.dataset.u);
+  if (!units.length) { err.innerHTML = '<div class="banner error">단원을 하나 이상 선택해주세요.</div>'; return; }
+
+  let picks = [];
+  const wantD = { '상': parseInt($('n-상').value, 10) || 0, '중': parseInt($('n-중').value, 10) || 0, '하': parseInt($('n-하').value, 10) || 0 };
+  const wantSum = wantD['상'] + wantD['중'] + wantD['하'];
+  let fillNotes = [];
+  const recipe = { units: units, shuffle: $('shuffle').checked, easyFirst: $('easy-first').checked, fillShort: $('fill-short').checked };
+  if (wantSum > 0) {
+    recipe.mode = 'difficulty'; recipe.diffCounts = wantD;
+    const poolsBy = {};
+    DIFFS.forEach(d => poolsBy[d] = units.map(u => shuffle(poolFor(u).filter(q => dKey(q) === d))));
+    const take = (d, need) => {
+      const got = [];
+      while (need > 0 && poolsBy[d].some(p => p.length)) {
+        for (const p of poolsBy[d]) { if (need <= 0) break; if (p.length) { got.push(p.pop()); need--; } }
+      }
+      return got;
+    };
+    const lack = {};
+    DIFFS.forEach(d => { const got = take(d, wantD[d]); picks = picks.concat(got); lack[d] = wantD[d] - got.length; });
+    const short = [];
+    DIFFS.forEach(d => {
+      if (lack[d] <= 0) return;
+      if ($('fill-short').checked) {
+        for (const d2 of FALLBACK[d]) {
+          if (lack[d] <= 0) break;
+          const g = take(d2, lack[d]);
+          if (g.length) { picks = picks.concat(g); lack[d] -= g.length; fillNotes.push(d + ' ' + g.length + '개가 모자라서 ' + d2 + ' 문항으로 채웠어요.'); }
+        }
+      }
+      if (lack[d] > 0) short.push(d + ' ' + wantD[d] + '개 요청 → ' + (wantD[d] - lack[d]) + '개뿐');
+    });
+    if (short.length) { err.innerHTML = '<div class="banner error">문항이 부족해요: ' + short.join(', ') + '. 개수를 줄이거나 단원을 더 선택하세요.</div>'; return; }
+  } else {
+    recipe.mode = 'count'; recipe.total = parseInt($('total').value, 10) || null;
+    const allowed = new Set(Array.from(document.querySelectorAll('.dfilter:checked')).map(c => c.value));
+    recipe.allowedDiff = Array.from(allowed);
+    const pool0 = {};
+    units.forEach(u => pool0[u] = poolFor(u).filter(q => allowed.has(dKey(q))));
+    const total = recipe.total;
+    if (total > 0) {
+      const pools = {};
+      units.forEach(u => pools[u] = shuffle(pool0[u].slice()));
+      let remaining = total;
+      while (remaining > 0 && units.some(u => pools[u].length)) {
+        for (const u of units) { if (remaining <= 0) break; if (pools[u].length) { picks.push(pools[u].pop()); remaining--; } }
+      }
+    } else {
+      recipe.perUnit = {};
+      units.forEach(u => {
+        const pool = shuffle(pool0[u].slice());
+        const raw = document.querySelector('.cnt[data-u="' + u.replace(/"/g, '\\"') + '"]').value.trim();
+        const n = raw ? Math.max(0, parseInt(raw, 10) || 0) : pool.length;
+        if (raw) recipe.perUnit[u] = n;
+        picks = picks.concat(pool.slice(0, n));
+      });
+    }
+  }
+  if (!picks.length) { err.innerHTML = '<div class="banner error">고를 수 있는 문항이 없어요. (겹치지 않게 제외하고 나니 남은 게 없을 수 있어요)</div>'; return; }
+  if ($('shuffle').checked) shuffle(picks);
+  else if ($('easy-first').checked) {
+    const rank = { '하': 0, '중': 1, '미정': 1, '상': 2 };
+    picks = picks.map((q, i) => [q, i]).sort((a, b) => (rank[dKey(a[0])] - rank[dKey(b[0])]) || (a[1] - b[1])).map(x => x[0]);
+  }
+  if (fillNotes.length) alert(fillNotes.join('\n'));
+  showReview(title, picks, recipe);
+}
+
+// ── 2단계: 검토 화면 — 빼거나 더 넣을 수 있다 ──
+let reviewPicks = [], reviewTitle = '', reviewRecipe = null;
+function showReview(title, picks, recipe) {
+  reviewPicks = picks.slice(); reviewTitle = title; reviewRecipe = recipe;
+  const formCard = document.querySelector('#content > .card');
+  if (formCard) formCard.style.display = 'none';
+  $('review-area').style.display = 'block';
+  renderReview();
+  $('review-area').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+function renderReview() {
+  const nSub = reviewPicks.filter(q => q.answer === '-').length;
+  $('review-area').innerHTML = `
+    <div class="card">
+      <h2 style="margin-top:0;">검토: "${escapeHtml(reviewTitle)}" · 총 ${reviewPicks.length}문항${nSub ? ' (주관식 ' + nSub + ')' : ''}</h2>
+      <p class="hint">빼고 싶은 문항은 "빼기"를 누르세요. 더 넣고 싶으면 아래에서 검색해서 추가하세요.</p>
+      <div id="review-list"></div>
+      <div style="margin-top:12px;">
+        <label>문항 추가 (단원·내용으로 검색)</label>
+        <input type="text" id="add-search" placeholder="검색어를 입력하세요">
+        <div id="add-results" class="hint"></div>
+      </div>
+      <div style="display:flex; gap:10px; margin-top:16px;">
+        <button type="button" class="btn ghost" id="back-btn" style="padding:10px 16px;">← 조건 다시 선택</button>
+        <button type="button" class="btn primary" id="finalize-btn" style="flex:1;">이 ${reviewPicks.length}문항으로 최종 확정 → PDF 만들기</button>
+      </div>
+    </div>`;
+  renderReviewList();
+  $('back-btn').addEventListener('click', () => {
+    const formCard = document.querySelector('#content > .card');
+    if (formCard) { $('review-area').style.display = 'none'; formCard.style.display = ''; }
+    else history.back();
+  });
+  $('finalize-btn').addEventListener('click', finalize);
+  $('add-search').addEventListener('input', renderAddResults);
+}
+function renderReviewList() {
+  $('review-list').innerHTML = reviewPicks.map((q, i) => `
+    <div class="review-row" data-i="${i}">
+      <img class="review-thumb" src="${driveThumb(q.fileId, 300)}" loading="lazy" title="누르면 크게 보여요">
+      <span><b>${i + 1}.</b> <span class="diff-tag d-${dKey(q)}">${dKey(q)}</span> ${escapeHtml(q.unit)}
+        ${q.answer === '-' ? '<span class="tag-sub">서술형</span>' : '<span class="hint">정답 ' + escapeHtml(q.answer) + '</span>'}
+        <br><span class="hint">${escapeHtml(q.textPreview || '')}</span></span>
+      <button type="button" class="btn danger rm-btn" data-i="${i}" style="padding:6px 12px;">빼기</button>
+    </div>`).join('');
+  $('review-list').querySelectorAll('.review-thumb').forEach(im => im.addEventListener('click', () => zoomImg(im.dataset.full || im.src.replace(/=w\d+$/, '=w1600'))));
+  $('review-list').querySelectorAll('.rm-btn').forEach(b => b.addEventListener('click', () => {
+    reviewPicks.splice(parseInt(b.dataset.i, 10), 1);
+    renderReview();
+  }));
+}
+function renderAddResults() {
+  const q = $('add-search').value.trim().toLowerCase();
+  const box = $('add-results');
+  if (!q) { box.innerHTML = ''; return; }
+  const pickedIds = new Set(reviewPicks.map(x => x.id));
+  const all = Object.values(groups).flat();
+  const hits = all.filter(x => !pickedIds.has(x.id) &&
+    (String(x.unit).toLowerCase().includes(q) || String(x.textPreview || '').toLowerCase().includes(q))).slice(0, 15);
+  box.innerHTML = hits.length ? hits.map(x => `
+    <div class="review-row">
+      <img class="review-thumb" src="${driveThumb(x.fileId, 300)}" loading="lazy" title="누르면 크게 보여요">
+      <span>${escapeHtml(x.unit)} <span class="diff-tag d-${dKey(x)}">${dKey(x)}</span> ${x.answer === '-' ? '<span class="tag-sub">서술형</span>' : '정답 ' + escapeHtml(x.answer)}<br><span class="hint">${escapeHtml(x.textPreview || '')}</span></span>
+      <button type="button" class="btn outline add-btn" data-id="${x.id}" style="padding:6px 12px;">추가</button>
+    </div>`).join('') : '<p class="hint">일치하는 문항이 없어요.</p>';
+  box.querySelectorAll('.review-thumb').forEach(im => im.addEventListener('click', (e) => { e.stopPropagation(); zoomImg(im.src.replace(/=w\d+$/, '=w1600')); }));
+  box.querySelectorAll('.add-btn').forEach(b => b.addEventListener('click', () => {
+    const item = all.find(x => x.id === b.dataset.id);
+    if (item) { reviewPicks.push(item); renderReview(); $('add-search').focus(); }
+  }));
+}
+
+// ── 3단계: 최종 확정 — PDF 생성 ──
+async function finalize() {
+  const err = $('error-banner');
+  err.innerHTML = '';
+  const picks = reviewPicks, title = reviewTitle, recipe = reviewRecipe;
+  const noAns = picks.filter(q => !q.answer);
+  if (noAns.length) {
+    err.innerHTML = '<div class="banner error">정답이 없는 문항이 ' + noAns.length + '개 있어요. 문제은행에서 정답을 먼저 입력하거나 검토 화면에서 빼주세요.</div>';
+    $('review-area').scrollIntoView({ behavior: 'smooth' });
+    return;
+  }
+  if ($('make-expl').checked) {
+    const nExpl = picks.filter(q => q.explFileId).length;
+    if (!nExpl) {
+      if (!confirm('선택한 ' + picks.length + '문항 모두 저장된 해설이 없어요.\n해설지 없이 시험지만 만들까요?')) return;
+    }
+  }
+  showSpinner('문항 이미지 불러오는 중...');
+  try {
+    const imgs = [];
+    const B = 5;
+    for (let s = 0; s < picks.length; s += B) {
+      const slice = picks.slice(s, s + B);
+      updateSpinner('문항 이미지 불러오는 중... ' + Math.min(s + B, picks.length) + '/' + picks.length);
+      const res = await callApi('getQuestionImages', { password: getTeacherPassword(), fileIds: slice.map(q => q.fileId) });
+      if (!res.ok) throw new Error(res.error || '이미지를 불러오지 못했어요');
+      res.images.forEach((im, k) => {
+        const q = slice[k];
+        const size = pngSize(BankCore.b64ToBytes(im.base64));
+        imgs.push({ base64: im.base64, width: size.width, height: size.height, naturalW: size.width / BankCore.CROP_SCALE, numRect: (q && q.numRect) || null, answer: q.answer });
+      });
+    }
+    updateSpinner('시험지 PDF 만드는 중...');
+    const examId = genExamId();
+    const doc = await BankCore.composeExamPdf(PDFLib, title, imgs, { qrReserve: 62 });
+    await stampQrOnDoc(doc, studentLinkFor(examId), { size: 50, corner: 'top-right', margin: 8 });
+
+    let edoc = null, explFillNote = '';
+    if ($('make-expl').checked) {
+      const withExpl = picks.filter(q => q.explFileId);
+      if (withExpl.length) {
+        const explImgs = [];
+        const map = {};
+        for (let s = 0; s < withExpl.length; s += B) {
+          const slice = withExpl.slice(s, s + B);
+          updateSpinner('해설 이미지 불러오는 중... ' + Math.min(s + B, withExpl.length) + '/' + withExpl.length);
+          const r2 = await callApi('getQuestionImages', { password: getTeacherPassword(), fileIds: slice.map(q => q.explFileId) });
+          if (!r2.ok) throw new Error(r2.error || '해설 이미지를 불러오지 못했어요');
+          r2.images.forEach(im => { map[im.fileId] = im.base64; });
+        }
+        picks.forEach(q => {
+          if (q.explFileId && map[q.explFileId]) {
+            const size = pngSize(BankCore.b64ToBytes(map[q.explFileId]));
+            explImgs.push({ base64: map[q.explFileId], width: size.width, height: size.height, naturalW: size.width / 2.2, numRect: q.explNumRect || null });
+          } else {
+            const c = document.createElement('canvas'); c.width = 660; c.height = 120;
+            const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, 660, 120);
+            x.fillStyle = '#6B7280'; x.font = '26px sans-serif';
+            x.fillText('(저장된 해설이 없는 문항)  정답: ' + q.answer, 20, 66);
+            explImgs.push({ base64: BankCore.canvasToBase64(c), width: 660, height: 120, naturalW: 300 });
+          }
+        });
+        if (withExpl.length < picks.length) explFillNote = '해설이 저장되지 않은 ' + (picks.length - withExpl.length) + '문항은 해설지에 정답만 적었어요.';
+        updateSpinner('해설지 만드는 중...');
+        const allPos = explImgs.every(x => x.numRect);
+        edoc = await BankCore.composeExamPdf(PDFLib, title + ' 해설', explImgs,
+          { subtitle: allPos ? '※ 정답 옆의 빨간 원 번호가 시험지의 문항 번호예요.' : '※ 왼쪽 빨간 원 번호가 시험지의 문항 번호예요. (해설 안에 다른 번호가 보여도 무시하세요)' });
+      }
+    }
+
+    const merged = await BankCore.mergePdfs(PDFLib, doc, edoc);
+    await BankCore.addPageNumbers(PDFLib, merged);
+    const pdfBase64 = arrayBufferToBase64(await merged.save());
+
+    updateSpinner('서버에 저장하는 중...');
+    const res = await callApi('createExam', {
+      password: getTeacherPassword(), id: examId, title: title,
+      answers: picks.map(q => String(q.answer)), pdfBase64: pdfBase64, filename: title,
+      sourceQuestionIds: picks.map(q => q.id), composeRecipe: recipe,
+    });
+    hideSpinner();
+    if (res.ok) { if (explFillNote) alert(explFillNote); location.href = 'teacher_exam.html?id=' + examId; }
+    else { err.innerHTML = '<div class="banner error">' + escapeHtml(res.error || '등록 실패') + '</div>'; }
+  } catch (e) {
+    hideSpinner();
+    err.innerHTML = '<div class="banner error">오류: ' + escapeHtml(e.message) + '</div>';
+  }
+}
+</script>
+</body>
+</html>

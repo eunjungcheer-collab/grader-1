@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#C1392B">
+<title>자동 채점 시스템</title>
+<link rel="stylesheet" href="css/style.css?v=202609290852">
+</head>
+<body>
+<template id="page-content">
+  <h1>학생 답안 자동 채점</h1>
+  <p class="muted">시험지를 등록하고 QR코드를 만들면, 학생들이 스캔해서 답을 제출하고 바로 채점됩니다. 제출 결과는 구글시트에 자동으로 쌓여요.</p>
+  <div class="actions">
+    <a class="btn primary" href="teacher_new.html">➕ 새 시험지 등록</a>
+    <a class="btn outline" href="teacher_list.html">📋 등록된 시험지 목록</a>
+    <a class="btn outline" href="records.html">🗂️ 시험 기록 관리</a>
+    <a class="btn outline" href="bank_list.html">🗂️ 문제은행</a>
+    <a class="btn outline" href="bank_compose.html">🧩 문제은행에서 시험 조합하기</a>
+  </div>
+</template>
+
+<script src="js/config.js?v=202609290852"></script>
+<script src="js/api.js?v=202609290852"></script>
+<script src="js/common.js?v=202609290852"></script>
+<script>renderHeader();</script>
+</body>
+</html>

@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#C1392B">
+<title>새 시험지 등록 - 자동 채점 시스템</title>
+<link rel="stylesheet" href="css/style.css?v=202609290852">
+</head>
+<body>
+<template id="page-content">
+  <span class="backlink"><a href="index.html">← 홈으로</a></span>
+  <h1>새 시험지 등록</h1>
+  <p class="muted">시험지 PDF를 올리면 문항 수를 찾고, <b>왼쪽에 PDF를 띄워놓고 오른쪽에 정답을 입력</b>할 수 있어요.</p>
+  <div id="error-banner"></div>
+
+  <form id="new-exam-form">
+    <div class="card">
+      <label>시험지 PDF (문제 + 정답 페이지가 같이 있어도 돼요)</label>
+      <input type="file" id="pdf-file" accept="application/pdf" required>
+      <label class="field-label-spaced">시험지 이름</label>
+      <input type="text" id="title" required>
+      <div id="scan-summary" class="banner" style="margin:14px 0 0; display:none;"></div>
+    </div>
+
+    <div id="scan-result" style="display:none;">
+      <div class="split">
+        <!-- 왼쪽: PDF -->
+        <div class="pane-left">
+          <div class="vhead">
+            <b>PDF</b>
+            <input type="number" id="go-page" min="1" placeholder="쪽">
+            <button type="button" class="btn ghost" id="go-btn">이동</button>
+            <button type="button" class="btn outline" id="go-answer">정답 쪽으로</button>
+            <button type="button" class="btn ghost" id="go-last">마지막 쪽</button>
+            <button type="button" class="btn ghost" id="zoom-out">−</button>
+            <button type="button" class="btn ghost" id="zoom-in">＋</button>
+          </div>
+          <div class="vhead" style="border-top:1px solid var(--line);">
+            <button type="button" class="btn outline" id="redact-toggle">✂️ 지우기 모드</button>
+            <span class="hint" id="redact-hint" style="margin:0;">PDF 위에서 드래그하면 그 자리를 흰색으로 지워요 (출처 워터마크, 기존 QR, 이름칸 등)</span>
+          </div>
+          <div id="watermark-candidates" style="display:none; padding:8px 10px; background:#FFF7ED; border-bottom:1px solid var(--line);"></div>
+          <div id="redact-list" style="display:none; padding:8px 10px; background:#F3F4F6; border-bottom:1px solid var(--line); font-size:13px;"></div>
+          <div class="vscroll" id="vscroll"></div>
+        </div>
+
+        <!-- 오른쪽: 정답 입력 -->
+        <div class="pane-right">
+          <div class="card">
+            <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap;">
+              <div style="width:110px;"><label>문항 수</label><input type="number" id="question-count" min="1" max="200" style="margin:0;"></div>
+              <button type="button" id="regen-btn" class="btn ghost" style="padding:10px 12px;">칸 다시 만들기</button>
+            </div>
+            <div class="entry-panel" id="entry-panel">
+              <div class="entry-head">지금 입력할 문항: <b id="cur-n">1</b>번 <span class="muted" id="cur-total"></span></div>
+              <div class="entry-snip" id="cur-snip"></div>
+            </div>
+            <p class="hint">💡 왼쪽 PDF를 보면서 숫자를 치면 자동으로 오른쪽 칸으로 넘어가요. (← → 방향키, Backspace로 되돌리기)<br>
+              ✍️ <b>주관식 문항</b>은 칸 아래 <b>「주」</b> 버튼을 누르거나 <b>-</b>를 입력하세요. 회색으로 비활성화되고, 답 입력에서 건너뛰며, 학생 화면·자동 채점에서 빠져요.</p>
+            <div class="box-row" id="boxes"></div>
+            <div class="hint" id="sub-note" style="margin-top:6px;"></div>
+
+            <label class="field-label-spaced">정답 붙여넣기 (선택)</label>
+            <textarea id="bulk-input" rows="3" placeholder="예: 31425... / 1③ 2① 3④ ... / 1. 3 (줄마다) — 주관식은 -  (예: -3142-5). 붙여넣으면 위 칸이 한 번에 채워져요" style="width:100%; padding:10px; border:1.5px solid var(--line); border-radius:8px; font-family:inherit;"></textarea>
+            <div class="hint" id="bulk-msg"></div>
+
+            <div class="card" style="margin-top:14px; padding:12px 14px;">
+              <b style="font-size:14px;">정답·해설 페이지</b>
+              <p class="hint" id="answer-page-auto">자동으로는 못 찾았어요.</p>
+              <p class="hint">자동으로 못 찾았거나 틀렸으면, 왼쪽 PDF에서 정답·해설이 있는 쪽을 확인하고 직접 입력하세요.</p>
+              <div class="date-row">
+                <div><input type="text" id="manual-ans-from" placeholder="시작 쪽"></div>
+                <span class="date-sep">~</span>
+                <div><input type="text" id="manual-ans-to" placeholder="끝 쪽"></div>
+                <button type="button" class="btn outline" id="manual-ans-apply" style="padding:10px 14px;">이 범위로 적용</button>
+              </div>
+              <p class="hint" id="answer-page-status"></p>
+            </div>
+            <label class="bank-include-label" id="strip-answer-label" style="margin-top:10px; display:none;">
+              <input type="checkbox" id="strip-answer" checked> 정답·해설 페이지는 빼고 QR 찍은 학생용 PDF 만들고, 뺀 페이지는 해설지로 저장
+            </label>
+            <div class="qr-opt">
+              <label style="margin:0;">QR 코드 크기·위치</label>
+              <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px;">
+                <select id="qr-size"><option value="40">아주 작게</option><option value="50">작게</option><option value="60" selected>보통</option><option value="80">크게</option></select>
+                <select id="qr-corner"><option value="top-right" selected>오른쪽 위</option><option value="top-left">왼쪽 위</option><option value="bottom-right">오른쪽 아래</option><option value="bottom-left">왼쪽 아래</option></select>
+              </div>
+              <div class="qr-prev" id="qr-prev"><canvas id="qr-prev-canvas" width="10" height="10"></canvas><div class="qr-box" id="qr-prev-box"></div></div>
+              <p class="hint">빨간 네모가 QR이 찍힐 자리예요(첫 페이지 미리보기). <b>지문이나 그림을 가리면</b> 크기를 줄이거나 다른 모서리로 바꾸세요.</p>
+            </div>
+            <button type="submit" class="btn primary" style="width:100%; margin-top:16px;" id="submit-btn" disabled>시험지 등록하고 QR 만들기</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </form>
+</template>
+
+<script src="js/vendor/qrcode.min.js?v=202609290852"></script>
+<script src="js/vendor/pdf-lib.min.js?v=202609290852"></script>
+<script src="js/vendor/pdf.min.js?v=202609290852"></script>
+<script src="js/config.js?v=202609290852"></script>
+<script src="js/api.js?v=202609290852"></script>
+<script src="js/common.js?v=202609290852"></script>
+<script src="js/bankcore.js?v=202609290852"></script>
+<script src="js/pdfui.js?v=202609290852"></script>
+<script src="js/pdfview.js?v=202609290852"></script>
+<script>
+requireLogin();
+renderHeader({ wide: true, wider: true });
+setupPdfJs();
+
+let scanned = null, pdfInfo = null, answerInputs = [], snipUrls = {}, pane = null, answerStartPage = 1;
+const $ = id => document.getElementById(id);
+
+$('pdf-file').addEventListener('change', async function () {
+  const file = this.files[0];
+  if (!file) return;
+  $('error-banner').innerHTML = '';
+  if (!$('title').value) $('title').value = baseNoExt(file.name);
+  showSpinner('PDF 분석 중...');
+  try {
+    pdfInfo = await loadPdfDoc(file);
+    scanned = await BankCore.scanPdf(pdfInfo.doc, (p, n) => updateSpinner('PDF 분석 중... ' + p + '/' + n + '쪽'));
+
+    // 정답이 글자로 된 표("1 ① 2 ③ ...")로 적혀 있으면 읽어서 미리 채운다
+    let tableInfo = null;
+    try { tableInfo = await BankCore.parseAnswerTable(pdfInfo.doc, scanned); } catch (e) {}
+    let tableCount = 0;
+    if (tableInfo && Object.keys(tableInfo.answers).length) {
+      Object.keys(tableInfo.answers).forEach(n => {
+        const cur = scanned.answers[n];
+        if (!cur) { scanned.answers[n] = { page: null, rect: null, text: tableInfo.answers[n], fromTable: true }; tableCount++; }
+        else if (!cur.text) { cur.text = tableInfo.answers[n]; cur.fromTable = true; tableCount++; }
+      });
+      if (!scanned.questionCount) scanned.questionCount = Math.max.apply(null, Object.keys(tableInfo.answers).map(Number));
+    }
+
+    scanned.subj = {};
+    try { scanned.subj = await BankCore.subjectiveGuess(pdfInfo.doc, scanned); } catch (e) {}
+    $('question-count').value = scanned.questionCount || 20;
+    let msg = '📄 ' + scanned.pageCount + '쪽 · 문항 ' + scanned.questionCount + '개를 찾았어요.';
+    if (scanned.answerPages.length) msg += ' 정답·해설은 ' + scanned.answerPages[0] + '~' + scanned.answerPages[scanned.answerPages.length - 1] + '쪽에서 찾았어요.';
+    if (tableCount) msg += ' 정답표(' + tableInfo.pages.join(',') + '쪽)에서 ' + tableCount + '개를 읽어 미리 채웠어요. 왼쪽 PDF와 맞는지 확인하세요.';
+    if (!scanned.answerPages.length && !tableCount) msg += ' 정답을 자동으로 읽지는 못했어요. 왼쪽 PDF의 정답 페이지를 보면서 입력하세요.';
+    if (!scanned.questionCount) msg = '⚠️ 문항 번호를 자동으로 못 찾았어요. 문항 수를 직접 입력해주세요.';
+    $('scan-summary').textContent = msg;
+    $('scan-summary').style.display = 'block';
+    $('scan-result').style.display = 'block';
+    $('strip-answer-label').style.display = scanned.answerPages.length ? 'flex' : 'none';
+    $('answer-page-auto').textContent = scanned.answerPages.length
+      ? '자동으로 찾은 범위: ' + scanned.answerPages[0] + '~' + scanned.answerPages[scanned.answerPages.length - 1] + '쪽'
+      : (tableCount ? '정답표(' + tableInfo.pages.join(',') + '쪽)에서 정답 글자는 읽었지만, 해설 페이지 범위는 못 찾았어요.' : '자동으로는 못 찾았어요.');
+    $('answer-page-status').textContent = '';
+    $('manual-ans-from').value = ''; $('manual-ans-to').value = '';
+
+    // 왼쪽 PDF: 정답 쪽(없으면 문제 다음 쪽, 없으면 마지막 쪽)으로 미리 이동
+    const lastQ = scanned.questionPages.length ? Math.max.apply(null, scanned.questionPages) : 0;
+    answerStartPage = scanned.answerPages[0] || (tableInfo && tableInfo.pages[0]) || (lastQ && lastQ < scanned.pageCount ? lastQ + 1 : scanned.pageCount);
+    $('go-page').max = scanned.pageCount;
+    pane = new PdfPane($('vscroll'));
+    pane.onRedactionsChange = renderRedactList;
+    await pane.setDoc(pdfInfo.doc, answerStartPage);
+    await buildBoxes();
+    drawQrPreview();
+
+    // 출처 워터마크·이름칸처럼 흔히 지우고 싶어하는 글자를 미리 찾아서 후보로 보여준다 (자동으로 지우지는 않음)
+    try {
+      const candidates = await BankCore.findWatermarkCandidates(pdfInfo.doc);
+      if (candidates.length) {
+        $('watermark-candidates').style.display = 'block';
+        $('watermark-candidates').innerHTML = '<b style="font-size:13px;">🔎 지울 만한 후보를 찾았어요 (눌러서 추가하세요):</b><br>' +
+          candidates.slice(0, 12).map((c, i) => '<button type="button" class="btn outline wm-add" data-i="' + i + '" style="padding:5px 10px; margin:4px 4px 0 0; font-size:12px;">' + escapeHtml(c.text).slice(0, 20) + ' (' + c.page + '쪽)</button>').join('');
+        $('watermark-candidates').querySelectorAll('.wm-add').forEach(b => b.addEventListener('click', () => {
+          const c = candidates[parseInt(b.dataset.i, 10)];
+          pane.addRedaction(c.page, c.rect);
+          pane.scrollToPage(c.page);
+          b.disabled = true; b.textContent = '✓ 추가됨';
+        }));
+      } else {
+        $('watermark-candidates').style.display = 'none';
+      }
+    } catch (e) {}
+  } catch (err) {
+    $('error-banner').innerHTML = '<div class="banner error">PDF를 읽지 못했어요: ' + escapeHtml(err.message) + '</div>';
+  }
+  hideSpinner();
+});
+
+// ── QR 자리 미리보기: 첫 페이지 작은 그림 위에 QR이 찍힐 위치를 빨간 네모로 보여준다 ──
+let qrGeom = null;
+async function drawQrPreview() {
+  try {
+    const page = await pdfInfo.doc.getPage(1);
+    const vp1 = page.getViewport({ scale: 1 });
+    const sc = 260 / vp1.width, vp = page.getViewport({ scale: sc });
+    const cv = $('qr-prev-canvas');
+    cv.width = Math.round(vp.width); cv.height = Math.round(vp.height);
+    const ctx = cv.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, cv.width, cv.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    qrGeom = { W: vp1.width, H: vp1.height, sc: sc };
+    updateQrBox();
+  } catch (e) {}
+}
+function qrOpts() { return { size: parseInt($('qr-size').value, 10), corner: $('qr-corner').value, margin: 10 }; }
+function updateQrBox() {
+  if (!qrGeom) return;
+  const o = qrOpts(), pl = qrPlacement(qrGeom.W, qrGeom.H, o), bx = $('qr-prev-box');
+  bx.style.left = Math.round(pl.x * qrGeom.sc) + 'px';
+  bx.style.top = Math.round((qrGeom.H - pl.y - pl.size) * qrGeom.sc) + 'px';
+  bx.style.width = Math.round(pl.size * qrGeom.sc) + 'px';
+  bx.style.height = Math.round(pl.size * qrGeom.sc) + 'px';
+}
+$('qr-size').addEventListener('change', updateQrBox);
+$('qr-corner').addEventListener('change', updateQrBox);
+
+// 왼쪽 PDF 조작
+$('go-btn').addEventListener('click', () => { const p = parseInt($('go-page').value, 10); if (p && pane) pane.scrollToPage(p); });
+$('go-page').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('go-btn').click(); } });
+$('go-answer').addEventListener('click', () => pane && pane.scrollToPage(answerStartPage));
+
+$('manual-ans-apply').addEventListener('click', function () {
+  if (!scanned) return;
+  const from = parseInt($('manual-ans-from').value, 10), to = parseInt($('manual-ans-to').value, 10) || from;
+  if (!from || from < 1 || from > scanned.pageCount || to < from) {
+    $('answer-page-status').innerHTML = '<span style="color:#B45309; font-weight:700;">⚠️ 쪽 번호를 확인해주세요. (1~' + scanned.pageCount + '쪽)</span>';
+    return;
+  }
+  const pages = [];
+  for (let p = from; p <= to; p++) pages.push(p);
+  scanned.answerPages = pages;      // 자동 감지 결과를 덮어씀 — 이후 해설지 생성·정답표 검색에 이 범위가 쓰인다
+  answerStartPage = from;
+  $('strip-answer-label').style.display = 'flex';
+  $('strip-answer').checked = true;
+  $('answer-page-status').innerHTML = '✅ ' + from + '~' + to + '쪽을 정답·해설 페이지로 직접 지정했어요.';
+  pane && pane.scrollToPage(from);
+});
+$('go-last').addEventListener('click', () => pane && pane.scrollToPage(scanned.pageCount));
+$('zoom-in').addEventListener('click', () => pane && pane.setScale(pane.scale * 1.2));
+$('zoom-out').addEventListener('click', () => pane && pane.setScale(pane.scale / 1.2));
+
+$('redact-toggle').addEventListener('click', () => {
+  if (!pane) return;
+  pane.setRedactMode(!pane.redactMode);
+  $('redact-toggle').classList.toggle('primary', pane.redactMode);
+  $('redact-toggle').classList.toggle('outline', !pane.redactMode);
+  $('redact-hint').textContent = pane.redactMode
+    ? '지우기 모드 켜짐 — PDF 위에서 드래그해서 지울 영역을 표시하세요. 다시 누르면 꺼져요.'
+    : 'PDF 위에서 드래그하면 그 자리를 흰색으로 지워요 (출처 워터마크, 기존 QR, 이름칸 등)';
+});
+function renderRedactList(list) {
+  if (!list.length) { $('redact-list').style.display = 'none'; return; }
+  $('redact-list').style.display = 'block';
+  $('redact-list').innerHTML = '🗑 지우기로 표시한 자리 ' + list.length + '곳: ' +
+    list.map((r, i) => '<button type="button" class="btn ghost rd-rm" data-i="' + i + '" style="padding:3px 8px; margin:2px; font-size:12px;">' + r.page + '쪽 ✕</button>').join('');
+  $('redact-list').querySelectorAll('.rd-rm').forEach(b => b.addEventListener('click', () => pane.removeRedaction(parseInt(b.dataset.i, 10))));
+}
+
+// 지금 칸의 정답 위치를 왼쪽 PDF에서 찾아서 표시 + 오른쪽 위 패널에 크게 보여준다
+function showCurrent(n) {
+  $('cur-n').textContent = n;
+  const a = scanned && scanned.answers[n];
+  const box = $('cur-snip');
+  if (a && a.text) {
+    box.innerHTML = '<span class="txt-ans">' + (a.fromTable ? '정답표에서 읽음' : '원본 정답') + ': ' + escapeHtml(a.text) + '</span> <span class="muted">(미리 채웠어요. 맞는지 확인하세요)</span>';
+  } else if (snipUrls[n]) {
+    box.innerHTML = '<img src="' + snipUrls[n] + '">';
+  } else {
+    box.innerHTML = '<span class="muted">' + (a ? '정답 표시를 불러오는 중...' : '이 번호의 정답 위치를 자동으로 찾지 못했어요. 왼쪽 PDF의 정답 페이지에서 ' + n + '번을 찾아보세요.') + '</span>';
+  }
+  if (pane && a && a.page && a.rect) pane.highlight(a.page, a.rect);
+}
+
+async function buildBoxes() {
+  const count = parseInt($('question-count').value, 10) || 0;
+  $('cur-total').textContent = '/ 총 ' + count + '문항';
+  const wrap = $('boxes');
+  wrap.innerHTML = '';
+  for (let n = 1; n <= count; n++) {
+    const a = scanned && scanned.answers[n];
+    const cell = document.createElement('div');
+    cell.className = 'abox';
+    cell.innerHTML = '<span>' + n + '</span><input type="text" class="ans-input" inputmode="numeric" maxlength="1" data-n="' + n + '" value="' + (a && a.text ? a.text : '') + '"><button type="button" class="sub-tog" title="주관식(자동 채점 제외)">주</button>';
+    wrap.appendChild(cell);
+  }
+  answerInputs = attachAnswerAdvance(wrap);
+  answerInputs.forEach(inp => {
+    const n = parseInt(inp.dataset.n, 10);
+    const cell = inp.closest('.abox');
+    inp.addEventListener('focus', () => showCurrent(n));
+    inp.addEventListener('input', () => {
+      if (inp.value === '-') setSubjective(inp, true, cell);      // '-' 를 치면 주관식
+      inp.classList.toggle('filled', !!inp.value);
+      updateSubNote();
+    });
+    cell.querySelector('.sub-tog').addEventListener('click', () => {
+      const on = !inp.disabled;
+      setSubjective(inp, on, cell);
+      if (!on) inp.focus();
+      updateSubNote();
+    });
+    inp.classList.toggle('filled', !!inp.value);
+    if (scanned && scanned.subj && scanned.subj[n]) setSubjective(inp, true, cell);   // 문제 글자로 추정한 주관식
+  });
+  $('submit-btn').disabled = false;
+  updateSubNote(scanned && scanned.subj ? Object.keys(scanned.subj).filter(k => scanned.subj[k] && k <= count).length : 0);
+  const firstOpen = answerInputs.find(i => !i.disabled);
+  if (firstOpen) { showCurrent(parseInt(firstOpen.dataset.n, 10)); firstOpen.focus({ preventScroll: true }); }
+
+  // 정답이 그림이라 글자로 못 읽는 경우, 그 부분을 크게 잘라서 미리 만들어 둔다
+  snipUrls = {};
+  if (scanned) {
+    for (let n = 1; n <= count; n++) {
+      const a = scanned.answers[n];
+      if (!a || a.text || !a.rect) continue;
+      try {
+        const c = await BankCore.renderRect(pdfInfo.doc, a.page, a.rect, 5, false);
+        snipUrls[n] = c.toDataURL('image/png');
+        if ($('cur-n').textContent === String(n)) showCurrent(n);
+      } catch (e) {}
+    }
+  }
+}
+$('regen-btn').addEventListener('click', buildBoxes);
+
+function updateSubNote(guessed) {
+  const subs = answerInputs.filter(i => i.disabled).map(i => i.dataset.n);
+  const obj = answerInputs.length - subs.length;
+  let t = '객관식 ' + obj + '문항 · 주관식 ' + subs.length + '문항' + (subs.length ? ' (' + subs.slice(0, 20).join(', ') + '번)' : '');
+  if (guessed) t += ' — 문제 글자("쓰시오" 등)를 보고 주관식 ' + guessed + '개를 미리 회색으로 표시했어요. 아니면 「주」를 눌러 되돌리세요.';
+  $('sub-note').textContent = t;
+}
+
+// 붙여넣기: 여러 형식을 알아서 해석
+$('bulk-input').addEventListener('input', function () {
+  const r = fillAnswersFromText(this.value, answerInputs);
+  answerInputs.forEach(inp => inp.classList.toggle('filled', !!inp.value));
+  updateSubNote();
+  if (!this.value.trim()) { $('bulk-msg').textContent = ''; return; }
+  const total = answerInputs.length;
+  $('bulk-msg').innerHTML = r.filled + '개를 채웠어요 (' + (r.mode === 'pairs' ? '번호+정답 형식' : '순서대로') + ', 문항 ' + total + '개).' +
+    (r.parsed !== total ? ' <span style="color:#B45309; font-weight:700;">⚠️ 붙여넣은 정답은 ' + r.parsed + '개라서 문항 수와 달라요. 확인해주세요.</span>' : ' ✅');
+});
+
+$('new-exam-form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  const errorBox = $('error-banner');
+  errorBox.innerHTML = '';
+  const title = $('title').value.trim();
+  const answers = answerInputs.map(i => i.value);
+  const missing = answers.map((a, i) => a ? null : i + 1).filter(Boolean);
+  if (!answers.length) { errorBox.innerHTML = '<div class="banner error">정답 칸이 없어요. PDF를 먼저 올려주세요.</div>'; return; }
+  if (missing.length) {
+    errorBox.innerHTML = '<div class="banner error">정답이 비어있는 문항이 있어요: ' + missing.slice(0, 15).join(', ') + (missing.length > 15 ? ' ...' : '') + '번</div>';
+    window.scrollTo(0, 0);
+    return;
+  }
+  $('submit-btn').disabled = true;
+  showSpinner('QR 만들고 PDF에 찍는 중...');
+  try {
+    const examId = genExamId();
+    const redactions = pane ? pane.redactions : [];
+    const hasAnswerPages = $('strip-answer').checked && scanned.answerPages.length;
+
+    // 복사방지(암호)가 걸린 PDF는 빈 비밀번호로 열어서 원래 글자·그림을 그대로 살린다(화질이 좋음).
+    // 그걸로도 안 열리는 아주 드문 경우에만, pdf.js가 화면에 그린 모습을 사진처럼 떠서 새 PDF를
+    // 만든다(글자 선택은 안 되지만 확실하게는 열린다).
+    let pdfDoc, explDoc = null;
+    try {
+      pdfDoc = await PDFLib.PDFDocument.load(pdfInfo.bytes.slice(0), { password: '' });
+      explDoc = hasAnswerPages ? await PDFLib.PDFDocument.load(pdfInfo.bytes.slice(0), { password: '' }) : null;
+      if (explDoc) for (let p = explDoc.getPageCount(); p >= 1; p--) if (!scanned.answerPages.includes(p)) explDoc.removePage(p - 1);
+      if (hasAnswerPages) scanned.answerPages.slice().sort((a, b) => b - a).forEach(p => pdfDoc.removePage(p - 1));
+    } catch (e) {
+      updateSpinner('이 PDF는 속 내용을 직접 못 읽어요 — 이미지로 다시 만드는 중...');
+      pdfDoc = await BankCore.rasterizeToPdf(PDFLib, pdfInfo.doc, hasAnswerPages ? scanned.answerPages : [], 2.2);
+      explDoc = hasAnswerPages ? await BankCore.rasterizeToPdf(PDFLib, pdfInfo.doc, [], 2.2, scanned.answerPages) : null;
+    }
+    BankCore.applyRedactions(PDFLib, pdfDoc, redactions.filter(r => !hasAnswerPages || !scanned.answerPages.includes(r.page)));
+    if (explDoc) BankCore.applyRedactions(PDFLib, explDoc, redactions.filter(r => scanned.answerPages.includes(r.page)));
+    await stampQrOnDoc(pdfDoc, studentLinkFor(examId), qrOpts());
+    const merged = await BankCore.mergePdfs(PDFLib, pdfDoc, explDoc);
+    await BankCore.addPageNumbers(PDFLib, merged);
+    const pdfBase64 = arrayBufferToBase64(await merged.save());
+    updateSpinner('서버에 저장하는 중...');
+    const res = await callApi('createExam', {
+      password: getTeacherPassword(), id: examId, title: title, answers: answers,
+      pdfBase64: pdfBase64, filename: title,
+    });
+    hideSpinner();
+    if (res.ok) location.href = 'teacher_exam.html?id=' + examId;
+    else { errorBox.innerHTML = '<div class="banner error">' + escapeHtml(res.error || '등록에 실패했어요.') + '</div>'; $('submit-btn').disabled = false; window.scrollTo(0, 0); }
+  } catch (err) {
+    hideSpinner();
+    errorBox.innerHTML = '<div class="banner error">오류가 발생했어요: ' + escapeHtml(err.message) + '</div>';
+    $('submit-btn').disabled = false;
+    window.scrollTo(0, 0);
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#C1392B">
+<title>시험지 상세 - 자동 채점 시스템</title>
+<link rel="stylesheet" href="css/style.css?v=202609290852">
+</head>
+<body>
+<template id="page-content">
+  <span class="backlink"><a href="teacher_list.html">← 시험지 목록</a></span>
+  <div id="detail-container" class="muted">불러오는 중...</div>
+</template>
+
+<script src="js/vendor/qrcode.min.js?v=202609290852"></script>
+<script src="js/config.js?v=202609290852"></script>
+<script src="js/api.js?v=202609290852"></script>
+<script src="js/common.js?v=202609290852"></script>
+<script src="js/pdfui.js?v=202609290852"></script>
+<script>
+requireLogin();
+renderHeader();
+
+const examId = new URLSearchParams(location.search).get('id');
+
+
+(async function () {
+  const container = document.getElementById('detail-container');
+  if (!examId) { container.innerHTML = '<div class="banner error">잘못된 접근이에요.</div>'; return; }
+
+  try {
+    const res = await callApi('getExamDetail', { password: getTeacherPassword(), id: examId });
+    if (!res.ok) { container.innerHTML = '<div class="banner error">' + res.error + '</div>'; return; }
+
+    const studentUrl = location.origin + location.pathname.replace('teacher_exam.html', '') + 'student_exam.html?id=' + res.id;
+
+    container.innerHTML = `
+      <h1>${res.title}</h1>
+      <p class="muted">${res.answers.length}문항${res.answers.some(a => a === '-') ? ' (주관식 ' + res.answers.filter(a => a === '-').length + ')' : ''} · ${formatDate(res.createdAt)} 등록</p>
+      <div class="card center">
+        <div id="qr-holder" class="qr-preview"></div>
+        <a class="btn primary" href="${res.pdfUrl}" target="_blank" style="width:100%;">📄 ${res.explUrl ? 'QR 찍힌 PDF 다운로드' : '시험지 PDF 다운로드 (해설 포함)'}</a>
+        ${res.explUrl ? '<a class="btn outline" href="' + res.explUrl + '" target="_blank" style="width:100%; margin-top:8px;">📝 해설지 PDF 열기 (예전 방식 — 따로 저장된 해설)</a>' : ''}
+        <p class="hint">학생 제출 링크: <a href="${studentUrl}">${studentUrl}</a></p>
+        <div style="display:flex; gap:8px; margin-top:12px;">
+          ${res.sourceQuestionIds && res.sourceQuestionIds.length ? '<a class="btn outline" href="bank_compose.html?regen=' + res.id + '" style="flex:1; padding:9px;">🔁 유사 시험지 만들기</a>' : ''}
+          <button type="button" class="btn danger" id="del-exam-btn" style="flex:1; padding:9px;">🗑 시험지 삭제</button>
+        </div>
+      </div>
+
+      <h2>정답표</h2>
+      <div class="card" style="line-height:2;">
+        ${res.answers.map((a, i) => a === '-' ? '<span style="display:inline-block; min-width:64px; color:#9CA3AF;"><b>' + (i + 1) + '</b>번 <span class="tag-sub">주관식</span></span>' : '<span style="display:inline-block; min-width:64px;"><b>' + (i + 1) + '</b>번 ' + a + '</span>').join('')}
+      </div>
+
+      <h2>제출 현황 (${res.submissions.length}명) <a href="records.html" class="hint" style="font-weight:400;">→ 전체 기록 관리에서 보기</a></h2>
+      <p class="hint">점수는 <b>객관식 ${res.answers.filter(a => a !== '-').length}문항</b>만 채점해서 <b>100점 만점으로 환산</b>한 값이에요.${res.answers.some(a => a === '-') ? ' 주관식 ' + res.answers.filter(a => a === '-').length + '문항은 합산하지 않아요.' : ''}
+        ${res.submissions.length ? '<br>평균 <b>' + (Math.round(res.submissions.reduce((a, x) => a + (to100(x.score, x.total) || 0), 0) / res.submissions.length * 10) / 10) + '점</b> · 최고 <b>' + Math.max.apply(null, res.submissions.map(x => to100(x.score, x.total) || 0)) + '점</b> · 최저 <b>' + Math.min.apply(null, res.submissions.map(x => to100(x.score, x.total) || 0)) + '점</b>' : ''}</p>
+      <div class="card">
+        ${res.submissions.length === 0 ? '<p class="muted">아직 제출한 학생이 없어요.</p>' :
+          res.submissions.map(s => `
+            <div class="submission-row">
+              <span>${escapeHtml(s.studentName)}</span>
+              <span><span class="score-badge ${s.total && s.score === s.total ? 'pass' : 'fail'}">${to100(s.score, s.total) === null ? '-' : to100(s.score, s.total) + '점'}</span> <span class="hint">(${s.score}/${s.total})</span></span>
+            </div>`).join('')}
+      </div>
+    `;
+
+    const qrCanvas = document.createElement('canvas');
+    QRCode.toCanvas(qrCanvas, studentUrl, { width: 160 }, function (err) {
+      if (!err) document.getElementById('qr-holder').appendChild(qrCanvas);
+    });
+
+    document.getElementById('del-exam-btn').addEventListener('click', async () => {
+      const alsoScores = confirm('"' + res.title + '" 시험지를 삭제할까요?\n\n확인을 누르면 제출 기록(학생 점수)도 함께 지워져요.\n제출 기록은 남기고 싶으면 취소한 뒤 다시 시도하지 말고, 시험지 목록에서 "삭제만"을 이용해주세요.');
+      const btn = document.getElementById('del-exam-btn');
+      btn.disabled = true; btn.textContent = '삭제 중...';
+      try {
+        const r = await callApi('deleteExam', { password: getTeacherPassword(), id: examId, deleteSubmissions: alsoScores });
+        if (!r.ok) throw new Error(r.error || '삭제 실패');
+        location.href = 'teacher_list.html';
+      } catch (e) { alert('삭제 중 오류: ' + e.message); btn.disabled = false; btn.textContent = '🗑 시험지 삭제'; }
+    });
+  } catch (err) {
+    container.innerHTML = '<div class="banner error">서버에 연결할 수 없어요.</div>';
+  }
+})();
+</script>
+</body>
+</html>

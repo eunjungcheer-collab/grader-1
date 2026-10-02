@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#C1392B">
+<title>시험 기록 관리 - 자동 채점 시스템</title>
+<link rel="stylesheet" href="css/style.css?v=202609290852">
+</head>
+<body>
+<template id="page-content">
+  <span class="backlink"><a href="index.html">← 홈으로</a></span>
+  <h1>시험 기록 관리</h1>
+  <p class="muted" id="total-text">불러오는 중...</p>
+
+  <div class="search-bar">
+    <input type="text" id="q" placeholder="학생 이름으로 검색">
+  </div>
+  <div id="exam-chips" style="display:flex; flex-wrap:wrap; gap:6px; margin:10px 0;"></div>
+  <div style="display:flex; gap:14px; align-items:center; margin:6px 0 14px;">
+    <span class="hint" style="margin:0;">정렬</span>
+    <select id="sort-sel" style="margin:0; padding:8px 10px; font-size:13px;">
+      <option value="date-desc">최신 제출순</option>
+      <option value="date-asc">오래된 제출순</option>
+      <option value="score-asc">점수 낮은순</option>
+      <option value="score-desc">점수 높은순</option>
+      <option value="name">이름순</option>
+    </select>
+  </div>
+
+  <div id="list"></div>
+  <div id="pager" class="sort-bar" style="justify-content:center;"></div>
+</template>
+
+<script src="js/vendor/pdf.min.js?v=202609290852"></script>
+<script src="js/config.js?v=202609290852"></script>
+<script src="js/api.js?v=202609290852"></script>
+<script src="js/common.js?v=202609290852"></script>
+<script src="js/bankcore.js?v=202609290852"></script>
+<script src="js/pdfui.js?v=202609290852"></script>
+<script>
+requireLogin();
+renderHeader({ wide: true });
+setupPdfJs();
+const $ = id => document.getElementById(id);
+const PER_PAGE = 20;
+let all = [], examFilter = '', page = 1;
+
+async function load() {
+  try {
+    const res = await callApi('listSubmissions', { password: getTeacherPassword() });
+    if (!res.ok) { $('total-text').textContent = res.error; return; }
+    all = res.submissions;
+    await ensureBankUnits();
+    render();
+  } catch (e) { $('total-text').textContent = '서버에 연결할 수 없어요.'; }
+}
+
+function filtered() {
+  const q = $('q').value.trim().toLowerCase();
+  let list = all.filter(s => (!examFilter || s.examId === examFilter) && (!q || String(s.studentName).toLowerCase().includes(q)));
+  const sort = $('sort-sel').value;
+  const byDate = (a, b) => new Date(a.submittedAt) - new Date(b.submittedAt);
+  if (sort === 'date-asc') list = list.slice().sort(byDate);
+  else if (sort === 'date-desc') list = list.slice().sort((a, b) => byDate(b, a));
+  else if (sort === 'score-asc') list = list.slice().sort((a, b) => a.score100 - b.score100);
+  else if (sort === 'score-desc') list = list.slice().sort((a, b) => b.score100 - a.score100);
+  else if (sort === 'name') list = list.slice().sort((a, b) => String(a.studentName).localeCompare(String(b.studentName), 'ko'));
+  return list;
+}
+
+// 학생이 틀린 문항이 어느 단원 소속인지 집계한다 (문제은행에서 만든 시험일 때만 가능)
+function wrongUnits(s) {
+  const correct = s.correctAnswers || [], ids = s.sourceQuestionIds || [];
+  const given = String(s.answers || '').split(',');
+  if (!ids.length || ids.length !== correct.length) return { count: 0, byUnit: {} };
+  const byUnit = {};
+  let count = 0;
+  for (let i = 0; i < correct.length; i++) {
+    if (correct[i] === '-') continue;              // 주관식은 자동 채점 대상이 아니므로 제외
+    if (String(given[i] || '') === String(correct[i])) continue;   // 맞힌 문항
+    count++;
+    const unit = (bankUnitOf[ids[i]] || '__unknown__');
+    byUnit[unit] = (byUnit[unit] || 0) + 1;
+  }
+  return { count: count, byUnit: byUnit };
+}
+// "새 시험지 등록"으로 올린(문제은행 출처 정보가 없는) 시험에서 틀린 객관식 문항 수
+function wrongCountNoSource(s) {
+  const correct = s.correctAnswers || [];
+  if (!correct.length || (s.sourceQuestionIds && s.sourceQuestionIds.length)) return 0;
+  const given = String(s.answers || '').split(',');
+  let n = 0;
+  for (let i = 0; i < correct.length; i++) {
+    if (correct[i] === '-') continue;
+    if (String(given[i] || '') !== String(correct[i])) n++;
+  }
+  return n;
+}
+
+// PDF를 다시 읽어서 틀린 문항의 글자를 뽑고, 문제은행에서 내용이 비슷한 문항을 찾는다.
+// (이 시험은 문제은행 출처 정보가 없어서, 단원이 아니라 "글자 내용"으로 비슷함을 가늠한다 — 완벽하진 않다.)
+async function findTextMatches(s) {
+  const d = await callApi('getExamDetail', { password: getTeacherPassword(), id: s.examId });
+  if (!d.ok || !d.pdfUrl) throw new Error('시험지 PDF 주소를 못 찾았어요.');
+  const doc = await pdfjsLib.getDocument({ url: d.pdfUrl }).promise;
+  const scan = await BankCore.scanPdf(doc);
+  const correct = s.correctAnswers || [];
+  const given = String(s.answers || '').split(',');
+  const queries = [];
+  for (let i = 0; i < correct.length; i++) {
+    if (correct[i] === '-' || String(given[i] || '') === String(correct[i])) continue;
+    const q = scan.questions.find(x => x.num === i + 1);
+    if (!q) continue;
+    const text = await BankCore.textPreview(doc, q.page, q.rect, 120);
+    if (text) queries.push({ num: i + 1, text: text });
+  }
+  if (!queries.length) throw new Error('틀린 문항의 글자를 PDF에서 읽지 못했어요. (그림으로 된 문항일 수 있어요)');
+  const bankRes = await callApi('listQuestions', { password: getTeacherPassword() });
+  if (!bankRes.ok) throw new Error('문제은행을 불러오지 못했어요.');
+  const { picks } = BankCore.findSimilarQuestions(queries, bankRes.questions, [], 1);
+  return { picks: picks, tried: queries.length };
+}
+
+let bankUnitOf = {};   // 문항 id -> 단원 (문제은행 목록에서 한 번만 불러와 캐시)
+async function ensureBankUnits() {
+  if (Object.keys(bankUnitOf).length) return;
+  try {
+    const r = await callApi('listQuestions', { password: getTeacherPassword() });
+    if (r.ok) r.questions.forEach(q => { bankUnitOf[q.id] = q.unit; });
+  } catch (e) {}
+}
+
+function render() {
+  $('total-text').textContent = '전체 ' + all.length + '건의 제출 기록이 있어요.';
+
+  const counts = {};
+  all.forEach(s => { const k = s.examId; counts[k] = counts[k] || { title: s.examTitle, n: 0 }; counts[k].n++; });
+  const exams = Object.entries(counts).sort((a, b) => b[1].n - a[1].n);
+  $('exam-chips').innerHTML =
+    '<button class="sort-btn ' + (examFilter ? '' : 'active') + '" data-e="">전체 시험</button>' +
+    exams.map(([id, v]) => '<button class="sort-btn ' + (examFilter === id ? 'active' : '') + '" data-e="' + id + '">' + escapeHtml(v.title) + ' (' + v.n + ')</button>').join('');
+  $('exam-chips').querySelectorAll('button').forEach(b => b.addEventListener('click', () => { examFilter = b.dataset.e; page = 1; render(); }));
+
+  const list = filtered();
+  const pages = Math.max(1, Math.ceil(list.length / PER_PAGE));
+  page = Math.min(page, pages);
+  const slice = list.slice((page - 1) * PER_PAGE, page * PER_PAGE);
+
+  $('list').innerHTML = slice.length ? slice.map((s, i) => `
+    <div class="card record-row" data-key="${i}">
+      <div class="record-main">
+        <div>
+          <b>${escapeHtml(s.studentName)}</b>
+          <span class="muted" style="margin-left:8px;">${escapeHtml(s.examTitle)}</span>
+        </div>
+        <div class="hint">${formatDate(s.submittedAt)}</div>
+      </div>
+      <div class="record-side">
+        <span class="score-badge ${s.total && s.score === s.total ? 'pass' : 'fail'}" id="badge-${i}">${s.total ? s.score100 + '점' : '-'}</span>
+        <span class="hint">(${s.score}/${s.total})</span>
+        <button type="button" class="btn ghost edit-btn" data-i="${i}" style="padding:7px 12px;">점수 수정</button>
+        <button type="button" class="btn danger del-btn" data-i="${i}" style="padding:7px 12px;">삭제</button>
+        ${(() => { const wu = wrongUnits(s); return wu.count ? '<button type="button" class="btn outline wrong-btn" data-i="' + i + '" style="padding:7px 12px;">📝 오답 유사문제 (' + wu.count + '개)</button>' : ''; })()}
+        ${(() => { const wc = wrongCountNoSource(s); return wc ? '<button type="button" class="btn outline textmatch-btn" data-i="' + i + '" style="padding:7px 12px;">🔍 비슷한 문제 찾기 (' + wc + '개)</button>' : ''; })()}
+      </div>
+      <div class="edit-panel" id="edit-${i}" style="display:none;">
+        <label>정답 수</label><input type="text" class="edit-score" id="es-${i}" value="${s.score}" inputmode="numeric" style="width:70px; display:inline-block; margin:0 8px;">
+        <label>전체 문항 수</label><input type="text" class="edit-total" id="et-${i}" value="${s.total}" inputmode="numeric" style="width:70px; display:inline-block; margin:0 8px;">
+        <button type="button" class="btn primary save-btn" data-i="${i}" style="padding:7px 12px;">저장</button>
+        <span class="hint edit-msg" id="msg-${i}"></span>
+      </div>
+    </div>`).join('') : '<div class="card center muted">해당하는 기록이 없어요.</div>';
+
+  slice.forEach((s, i) => {
+    document.querySelector('.edit-btn[data-i="' + i + '"]').addEventListener('click', () => {
+      const p = $('edit-' + i); p.style.display = p.style.display === 'none' ? 'block' : 'none';
+    });
+    document.querySelector('.save-btn[data-i="' + i + '"]').addEventListener('click', async () => {
+      const score = $('es-' + i).value.trim(), total = $('et-' + i).value.trim();
+      const msg = $('msg-' + i); msg.textContent = '저장 중…';
+      const res = await callApi('updateSubmissionScore', { password: getTeacherPassword(), examId: s.examId, studentName: s.studentName, submittedAt: s.submittedAt, score: score, total: total });
+      if (res.ok) {
+        s.score = res.score; s.total = res.total; s.score100 = res.score100;
+        const badge = $('badge-' + i); badge.textContent = res.total ? res.score100 + '점' : '-';
+        badge.className = 'score-badge ' + (res.total && res.score === res.total ? 'pass' : 'fail');
+        document.getElementById('edit-' + i).previousElementSibling.querySelector('.hint').textContent = '(' + res.score + '/' + res.total + ')';
+        msg.textContent = '✅ 저장됨';
+      } else { msg.textContent = '⚠️ ' + res.error; }
+    });
+    document.querySelector('.del-btn[data-i="' + i + '"]').addEventListener('click', async () => {
+      if (!confirm(s.studentName + '님의 "' + s.examTitle + '" 제출 기록을 삭제할까요? 되돌릴 수 없어요.')) return;
+      const res = await callApi('deleteSubmission', { password: getTeacherPassword(), examId: s.examId, studentName: s.studentName, submittedAt: s.submittedAt });
+      if (res.ok) { all = all.filter(x => x !== s); render(); } else alert(res.error);
+    });
+    const wrongBtn = document.querySelector('.wrong-btn[data-i="' + i + '"]');
+    if (wrongBtn) wrongBtn.addEventListener('click', () => {
+      const wu = wrongUnits(s);
+      delete wu.byUnit['__unknown__'];
+      if (!Object.keys(wu.byUnit).length) { alert('틀린 문항의 단원 정보를 찾을 수 없어요. (문제은행에서 지워진 문항일 수 있어요)'); return; }
+      const param = encodeURIComponent(JSON.stringify(wu.byUnit));
+      location.href = 'bank_compose.html?units=' + param + '&excludeExam=' + encodeURIComponent(s.examId);
+    });
+    const textBtn = document.querySelector('.textmatch-btn[data-i="' + i + '"]');
+    if (textBtn) textBtn.addEventListener('click', async () => {
+      textBtn.disabled = true; const origText = textBtn.textContent; textBtn.textContent = '찾는 중...';
+      try {
+        const { picks, tried } = await findTextMatches(s);
+        if (!picks.length) { alert('문제은행에서 비슷한 문항을 찾지 못했어요. (아직 관련 단원 문항이 적을 수 있어요)'); return; }
+        if (picks.length < tried) alert('틀린 ' + tried + '문항 중 ' + picks.length + '개만 비슷한 문항을 찾았어요.');
+        const ids = encodeURIComponent(JSON.stringify(picks.map(p => p.id)));
+        const title = encodeURIComponent(s.examTitle + ' - 비슷한 문제');
+        location.href = 'bank_compose.html?directIds=' + ids + '&title=' + title;
+      } catch (e) { alert('비슷한 문항을 찾는 중 오류가 났어요: ' + e.message); }
+      finally { textBtn.disabled = false; textBtn.textContent = origText; }
+    });
+  });
+
+  $('pager').innerHTML = pages > 1 ?
+    (page > 1 ? '<button class="sort-btn" id="prev">← 이전</button>' : '') +
+    '<span class="sort-btn active">' + page + ' / ' + pages + '</span>' +
+    (page < pages ? '<button class="sort-btn" id="next">다음 →</button>' : '') : '';
+  if ($('prev')) $('prev').addEventListener('click', () => { page--; render(); window.scrollTo(0, 0); });
+  if ($('next')) $('next').addEventListener('click', () => { page++; render(); window.scrollTo(0, 0); });
+}
+
+$('q').addEventListener('input', () => { page = 1; render(); });
+$('sort-sel').addEventListener('change', () => { page = 1; render(); });
+load();
+</script>
+</body>
+</html>
